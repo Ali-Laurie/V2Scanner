@@ -1,0 +1,1 @@
+{"log": {"loglevel": "none"}, "inbounds": [{"port": 57269, "listen": "127.0.0.1", "protocol": "http"}], "outbounds": [{"protocol": "vless", "settings": {"vnext": [{"address": "avalpardakht.com", "port": 80, "users": [{"id": "392afad2-43e3-4414-a5c3-b529a44df4e3", "encryption": "none"}]}]}, "streamSettings": {"network": "tcp", "security": "none"}}]}
