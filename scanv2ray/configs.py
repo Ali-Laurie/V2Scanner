@@ -27,15 +27,25 @@ def build_xray_stream_settings(parsed):
         if security_mode == 'xtls':
             stream_settings['xtlsSettings'] = {
                 'serverName': tls_target,
-                'allowInsecure': True,
                 'alpn': _parse_alpn(extra.get('alpn', ''))
             }
         else:
             stream_settings['tlsSettings'] = {
                 'serverName': tls_target,
-                'allowInsecure': True,
                 'alpn': _parse_alpn(extra.get('alpn', ''))
             }
+    elif security_mode == 'reality':
+        reality_target = sni or host_header or host or ''
+        reality_settings = {
+            'serverName': reality_target,
+            'fingerprint': extra.get('fp', 'chrome') or 'chrome',
+            'publicKey': extra.get('pbk', ''),
+            'shortId': extra.get('sid', ''),
+            'spiderX': extra.get('spx', '') or '/'
+        }
+        if extra.get('alpn'):
+            reality_settings['alpn'] = _parse_alpn(extra.get('alpn', ''))
+        stream_settings['realitySettings'] = reality_settings
 
     if transport_type == 'ws':
         stream_settings['wsSettings'] = {
@@ -80,6 +90,8 @@ def build_xray_stream_settings(parsed):
 
 def make_xray_config(parsed, local_port):
     if not parsed:
+        return None
+    if parsed.get('proto') in ('hysteria', 'hysteria2'):
         return None
 
     outbound = {
@@ -131,6 +143,7 @@ def make_xray_config(parsed, local_port):
             ]
         }
     elif parsed['proto'] == 'ss':
+        outbound['protocol'] = 'shadowsocks'
         method, password = parsed['credentials'].split(':', 1) if ':' in parsed['credentials'] else ('aes-256-gcm', parsed['credentials'])
         outbound['settings'] = {
             'servers': [

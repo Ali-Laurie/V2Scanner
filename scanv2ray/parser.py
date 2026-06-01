@@ -256,6 +256,7 @@ def parse_generic(link):
         flow = q.get('flow', [''])[0]
         alpn = q.get('alpn', [''])[0]
         fp = q.get('fp', [''])[0]
+        pbk = q.get('pbk', [''])[0]
         pbkdf2 = q.get('pbkdf2', [''])[0]
         mode = q.get('mode', [''])[0]
         header_type = q.get('headerType', q.get('header-type', ['']))[0]
@@ -267,10 +268,13 @@ def parse_generic(link):
         down = q.get('down', [''])[0]
         peer = q.get('peer', [''])[0]
         insecure = q.get('insecure', [''])[0]
+        short_id = q.get('sid', [''])[0]
+        spider_x = q.get('spx', [''])[0]
 
         extra = {
             'alpn': alpn,
             'fp': fp,
+            'pbk': pbk,
             'pbkdf2': pbkdf2,
             'mode': mode,
             'headerType': header_type,
@@ -283,6 +287,8 @@ def parse_generic(link):
             'peer': peer,
             'protocol': q.get('protocol', [''])[0],
             'insecure': insecure,
+            'sid': short_id,
+            'spx': spider_x,
         }
         extra = {k: v for k, v in extra.items() if v}
 

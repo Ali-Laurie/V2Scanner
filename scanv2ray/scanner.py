@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 import uuid
 from urllib.request import ProxyHandler, build_opener, Request
@@ -22,6 +23,10 @@ class Scanner:
     def __init__(self, xray_path, singbox_path):
         self.xray_path = xray_path
         self.singbox_path = singbox_path
+        self.speed_test_semaphore = threading.BoundedSemaphore(6)
+
+    def set_speed_test_limit(self, limit):
+        self.speed_test_semaphore = threading.BoundedSemaphore(max(1, int(limit)))
 
     def _write_config(self, config_data):
         config_filename = f'temp_config_{uuid.uuid4().hex}.json'
@@ -39,7 +44,7 @@ class Scanner:
                 stderr=subprocess.PIPE,
                 creationflags=CREATE_NO_WINDOW
             )
-            time.sleep(0.8)
+            time.sleep(0.2)
             return proc
         except Exception:
             try:
@@ -119,11 +124,12 @@ class Scanner:
 
         endpoints = [
             'https://www.gstatic.com/generate_204',
-            'https://www.google.com/generate_204',
-            'https://www.cloudflare.com/cdn-cgi/trace'
+            'https://www.cloudflare.com/cdn-cgi/trace',
+            'https://www.google.com/generate_204'
         ]
         if quick:
             endpoints = endpoints[:2]
+        endpoint_timeout = min(timeout, 2.5) if quick else timeout
 
         metrics = {
             'requests': 0,
@@ -139,7 +145,7 @@ class Scanner:
             metrics['requests'] += 1
             start_time = time.time()
             try:
-                with opener.open(req, timeout=timeout) as response:
+                with opener.open(req, timeout=endpoint_timeout) as response:
                     status = response.getcode()
                     elapsed = int((time.time() - start_time) * 1000)
                     if status in (200, 204):
@@ -147,18 +153,29 @@ class Scanner:
                         metrics['latencies'].append(elapsed)
                         if metrics['first_response_ms'] is None:
                             metrics['first_response_ms'] = elapsed
+                        if quick:
+                            break
                     else:
                         metrics['error_count'] += 1
             except Exception:
                 metrics['error_count'] += 1
 
-        download_url = 'https://speed.cloudflare.com/__down?bytes=200000'
+        connectivity_ratio = metrics['successes'] / metrics['requests'] if metrics['requests'] else 0.0
+        if metrics['successes'] == 0:
+            metrics['success_ratio'] = connectivity_ratio
+            metrics['average_latency'] = int(sum(metrics['latencies']) / len(metrics['latencies'])) if metrics['latencies'] else None
+            return metrics
+
+        download_bytes = 30000 if quick else 200000
+        download_url = f'https://speed.cloudflare.com/__down?bytes={download_bytes}'
         metrics['requests'] += 1
         dl_start = time.time()
         try:
-            dl_req = Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
-            with opener.open(dl_req, timeout=max(timeout, 8.0)) as response:
-                data = response.read(200000)
+            with self.speed_test_semaphore:
+                dl_req = Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
+                download_timeout = max(endpoint_timeout, 4.0) if quick else max(timeout, 8.0)
+                with opener.open(dl_req, timeout=download_timeout) as response:
+                    data = response.read(download_bytes)
             duration = time.time() - dl_start
             if duration > 0 and len(data) > 0:
                 metrics['download_kbps'] = len(data) / 1024 / duration
@@ -212,16 +229,12 @@ class Scanner:
     def _build_config(self, parsed, local_port, engine):
         if engine == 'xray':
             return configs.make_xray_config(parsed, local_port)
-        if engine == 'singbox':
-            return configs.make_singbox_config(parsed, local_port)
         return None
 
     def _validate_config(self, binary_path, config_path, engine):
-        if engine == 'xray':
-            return self._validate_xray_config(binary_path, config_path)
-        return self._validate_singbox_config(binary_path, config_path)
+        return self._validate_xray_config(binary_path, config_path)
 
-    def _test_core(self, parsed, timeout, binary_path, engine, quick=False):
+    def _test_core(self, parsed, timeout, binary_path, engine, quick=False, prevalidated=False):
         if not os.path.exists(binary_path):
             return None
 
@@ -231,42 +244,115 @@ class Scanner:
             return None
 
         config_path = self._write_config(config_data)
-        if not self._validate_config(binary_path, config_path, engine):
+        if not prevalidated and not self._validate_config(binary_path, config_path, engine):
             self._cleanup_process(None, config_path)
             return None
 
-        args = [binary_path, '-c', config_path] if engine == 'xray' else [binary_path, 'run', '-c', config_path]
+        args = [binary_path, '-c', config_path]
         proc = self._run_core_process(args)
         if not proc:
             self._cleanup_process(proc, config_path)
             return None
 
-        if not self._wait_for_local_port(local_port, timeout=max(timeout, 5.0)):
+        startup_timeout = 2.0 if quick else min(max(timeout, 2.0), 4.0)
+        if not self._wait_for_local_port(local_port, timeout=startup_timeout):
             self._cleanup_process(proc, config_path)
             return None
 
-        metrics = self._measure_proxy(local_port, timeout, quick=quick)
-        self._cleanup_process(proc, config_path)
-        if metrics['success_ratio'] < 0.6 or metrics['download_kbps'] < 1.0:
-            return None
+        try:
+            metrics = self._measure_proxy(local_port, timeout, quick=quick)
+            if metrics['success_ratio'] < 0.6 or metrics['download_kbps'] < 1.0:
+                return None
 
-        return self._build_benchmark_result(parsed.get('link', ''), parsed, engine, metrics)
+            return self._build_benchmark_result(parsed.get('link', ''), parsed, engine, metrics)
+        finally:
+            self._cleanup_process(proc, config_path)
+
+    def precheck_link(self, link, timeout=0.7):
+        parsed = parser.parse_link(link)
+        if not parsed or not parsed.get('host') or not parsed.get('port'):
+            return {'ok': False, 'link': link, 'reason': 'parse_failed'}
+
+        valid, reason = parser.validate_parsed_config(parsed)
+        if not valid:
+            return {'ok': False, 'link': link, 'reason': reason or 'parser_validation_failed'}
+
+        if parsed.get('proto') in ('hysteria', 'hysteria2'):
+            return {'ok': False, 'link': link, 'reason': 'xray_unsupported_protocol'}
+
+        parsed['link'] = link
+        try:
+            with socket.create_connection((parsed['host'], parsed['port']), timeout=timeout):
+                return {'ok': True, 'link': link, 'parsed': parsed}
+        except socket.gaierror:
+            return {'ok': False, 'link': link, 'reason': 'tcp_dns_failed'}
+        except TimeoutError:
+            return {'ok': False, 'link': link, 'reason': 'tcp_timeout'}
+        except OSError as e:
+            return {'ok': False, 'link': link, 'reason': f'tcp_failed:{getattr(e, "errno", "") or e.__class__.__name__}'}
+
+    def validate_prechecked_link(self, item):
+        parsed = item.get('parsed')
+        link = item.get('link', '')
+        if not parsed:
+            return {'ok': False, 'link': link, 'reason': item.get('reason', 'parse_failed')}
+
+        if not os.path.exists(self.xray_path):
+            return {'ok': False, 'link': link, 'reason': 'xray_missing'}
+
+        config_data = configs.make_xray_config(parsed, get_free_port())
+        if not config_data:
+            return {'ok': False, 'link': link, 'reason': 'xray_unsupported_protocol'}
+
+        config_path = self._write_config(config_data)
+        try:
+            if not self._validate_xray_config(self.xray_path, config_path):
+                return {'ok': False, 'link': link, 'reason': 'xray_json_invalid'}
+        finally:
+            self._cleanup_process(None, config_path)
+
+        return {'ok': True, 'link': link, 'parsed': parsed}
 
     def _fast_core_test(self, parsed, timeout):
-        if parsed.get('proto') == 'ss':
-            if os.path.exists(self.singbox_path):
-                result = self._test_core(parsed, timeout, self.singbox_path, 'singbox', quick=True)
-                if result or not os.path.exists(self.xray_path):
-                    return result
-            if os.path.exists(self.xray_path):
-                return self._test_core(parsed, timeout, self.xray_path, 'xray', quick=True)
-            return None
-
         if os.path.exists(self.xray_path):
             return self._test_core(parsed, timeout, self.xray_path, 'xray', quick=True)
-        if os.path.exists(self.singbox_path):
-            return self._test_core(parsed, timeout, self.singbox_path, 'singbox', quick=True)
         return None
+
+    def prepare_link(self, link):
+        parsed = parser.parse_link(link)
+        if not parsed or not parsed.get('host') or not parsed.get('port'):
+            return {'ok': False, 'link': link, 'reason': 'parse_failed'}
+
+        valid, reason = parser.validate_parsed_config(parsed)
+        if not valid:
+            return {'ok': False, 'link': link, 'reason': reason or 'parser_validation_failed'}
+
+        parsed['link'] = link
+        if not os.path.exists(self.xray_path):
+            return {'ok': False, 'link': link, 'reason': 'xray_missing'}
+
+        config_data = configs.make_xray_config(parsed, get_free_port())
+        if not config_data:
+            return {'ok': False, 'link': link, 'reason': 'xray_unsupported_protocol'}
+
+        config_path = self._write_config(config_data)
+        try:
+            if not self._validate_xray_config(self.xray_path, config_path):
+                return {'ok': False, 'link': link, 'reason': 'xray_json_invalid'}
+        finally:
+            self._cleanup_process(None, config_path)
+
+        return {'ok': True, 'link': link, 'parsed': parsed}
+
+    def test_prepared_link(self, prepared, timeout, method):
+        parsed = prepared.get('parsed')
+        if not parsed:
+            return None
+        quick = method == 'fast'
+        result = self._test_core(parsed, timeout, self.xray_path, 'xray', quick=quick, prevalidated=True)
+        if result:
+            result['method'] = method
+        return result
 
     def process_link(self, link, timeout, methods):
         parsed = parser.parse_link(link)
@@ -285,23 +371,9 @@ class Scanner:
             if core_result:
                 results.append({**core_result, 'method': 'fast'})
 
-        if parsed.get('proto') == 'ss' and 'xray' in methods and 'singbox' in methods and os.path.exists(self.xray_path) and os.path.exists(self.singbox_path):
+        if 'xray' in methods and os.path.exists(self.xray_path):
             core_result = self._test_core(parsed, timeout, self.xray_path, 'xray')
             if core_result:
                 results.append(core_result)
-            else:
-                core_result = self._test_core(parsed, timeout, self.singbox_path, 'singbox')
-                if core_result:
-                    results.append(core_result)
-        else:
-            if 'xray' in methods and os.path.exists(self.xray_path):
-                core_result = self._test_core(parsed, timeout, self.xray_path, 'xray')
-                if core_result:
-                    results.append(core_result)
-
-            if 'singbox' in methods and os.path.exists(self.singbox_path):
-                core_result = self._test_core(parsed, timeout, self.singbox_path, 'singbox')
-                if core_result:
-                    results.append(core_result)
 
         return results
