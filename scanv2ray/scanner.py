@@ -166,7 +166,7 @@ class Scanner:
             metrics['average_latency'] = int(sum(metrics['latencies']) / len(metrics['latencies'])) if metrics['latencies'] else None
             return metrics
 
-        download_bytes = 30000 if quick else 200000
+        download_bytes = 10000 if quick else 50000
         download_url = f'https://speed.cloudflare.com/__down?bytes={download_bytes}'
         metrics['requests'] += 1
         dl_start = time.time()
@@ -192,7 +192,7 @@ class Scanner:
         return metrics
 
     def _score_metrics(self, metrics):
-        if metrics['success_ratio'] < 0.6 or metrics['download_kbps'] < 1.0:
+        if metrics['success_ratio'] < 0.3 and metrics['download_kbps'] < 1.0:
             return 0.0, 'dead'
 
         speed_score = min(metrics['download_kbps'] / 200.0 * 100.0, 100.0)
@@ -261,7 +261,7 @@ class Scanner:
 
         try:
             metrics = self._measure_proxy(local_port, timeout, quick=quick)
-            if metrics['success_ratio'] < 0.6 or metrics['download_kbps'] < 1.0:
+            if metrics['success_ratio'] < 0.3 and metrics['download_kbps'] < 1.0:
                 return None
 
             return self._build_benchmark_result(parsed.get('link', ''), parsed, engine, metrics)

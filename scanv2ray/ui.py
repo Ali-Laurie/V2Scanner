@@ -2,12 +2,15 @@ import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from tkinter import filedialog, StringVar
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
+from tkinter import filedialog, StringVar, Listbox, END
 
 import customtkinter as ctk
+import re
+import webbrowser
+import sys
 
-from .parser import extract_links, resolve_source
+from .parser import extract_links, resolve_source, parse_link
 from .scanner import Scanner
 
 
@@ -24,6 +27,7 @@ class ConfigScannerApp(ctk.CTk):
 
         self.folder_path = None
         self.loaded_links = set()
+        self.link_protocols = {}
         self.fast_links = []
         self.normal_links = []
         self.active_links = []
@@ -40,8 +44,14 @@ class ConfigScannerApp(ctk.CTk):
         self.scanner = Scanner(xray_path, singbox_path)
 
         self.scan_mode_var = StringVar(value='Fast')
+        self.remarker_var = StringVar(value='')
 
         self._build_ui()
+        # Load About.md info for Donate popup
+        try:
+            self.about_info = self._load_about_info()
+        except Exception:
+            self.about_info = {}
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
@@ -57,6 +67,10 @@ class ConfigScannerApp(ctk.CTk):
             font=ctk.CTkFont(size=28, weight='bold')
         )
         self.header.grid(row=0, column=0, sticky='w')
+        # Donate button
+        self.header_frame.grid_columnconfigure(1, weight=0)
+        self.donate_btn = ctk.CTkButton(self.header_frame, text='Donate', command=self.open_donate_popup, fg_color='#b7791f')
+        self.donate_btn.grid(row=0, column=1, sticky='e')
 
         self.subtitle = ctk.CTkLabel(
             self.header_frame,
@@ -104,18 +118,31 @@ class ConfigScannerApp(ctk.CTk):
         )
         self.source_hint.grid(row=1, column=0, padx=14, pady=(0, 8), sticky='w')
 
-        self.source_textbox = ctk.CTkTextbox(self.source_frame, height=150, wrap='word')
-        self.source_textbox.grid(row=2, column=0, padx=14, pady=(0, 10), sticky='ew')
+        self.source_textbox = ctk.CTkTextbox(self.source_frame, height=110, wrap='word')
+        self.source_textbox.grid(row=2, column=0, padx=14, pady=(0, 8), sticky='ew')
+
+        # Visible list of loaded sources (so user can see and remove selections)
+        self.sources_listbox = Listbox(self.source_frame, height=6, selectmode='extended')
+        self.sources_listbox.grid(row=3, column=0, padx=14, pady=(0, 8), sticky='ew')
 
         self.source_actions = ctk.CTkFrame(self.source_frame, fg_color='transparent')
-        self.source_actions.grid(row=3, column=0, padx=9, pady=(0, 8), sticky='ew')
-        self.source_actions.grid_columnconfigure((0, 1, 2), weight=1)
+        self.source_actions.grid(row=4, column=0, padx=9, pady=(0, 8), sticky='ew')
+        self.source_actions.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         self.add_links_btn = ctk.CTkButton(self.source_actions, text='Add pasted sources', command=self.add_manual_sources)
         self.add_links_btn.grid(row=0, column=0, padx=5, sticky='ew')
 
         self.add_files_btn = ctk.CTkButton(self.source_actions, text='Add files', command=self.add_files)
         self.add_files_btn.grid(row=0, column=1, padx=5, sticky='ew')
+
+        self.remove_selected_btn = ctk.CTkButton(
+            self.source_actions,
+            text='Remove selected',
+            command=self.remove_selected_sources,
+            fg_color='#c53030',
+            hover_color='#9b2c2c'
+        )
+        self.remove_selected_btn.grid(row=0, column=2, padx=5, sticky='ew')
 
         self.clear_sources_btn = ctk.CTkButton(
             self.source_actions,
@@ -124,14 +151,30 @@ class ConfigScannerApp(ctk.CTk):
             fg_color='#3b4252',
             hover_color='#4c566a'
         )
-        self.clear_sources_btn.grid(row=0, column=2, padx=5, sticky='ew')
+        self.clear_sources_btn.grid(row=0, column=3, padx=5, sticky='ew')
+
+        # Protocol filters and counts
+        self.protocols = ['vmess', 'vless', 'ss', 'trojan']
+        self.protocol_vars = {p: StringVar(value='1') for p in self.protocols}
+        self.protocol_count_labels = {}
+
+        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color='transparent')
+        self.protocols_frame.grid(row=5, column=0, padx=14, pady=(6, 6), sticky='ew')
+        self.protocols_frame.grid_columnconfigure(tuple(range(len(self.protocols))), weight=1)
+
+        for i, proto in enumerate(self.protocols):
+            chk = ctk.CTkCheckBox(self.protocols_frame, text=proto.upper(), variable=self.protocol_vars[proto], onvalue='1', offvalue='0', command=self.update_link_count)
+            chk.grid(row=0, column=i, sticky='w')
+            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color='#aab2bd')
+            lbl.grid(row=1, column=i, sticky='w', pady=(4, 0))
+            self.protocol_count_labels[proto] = lbl
 
         self.link_count_label = ctk.CTkLabel(
             self.source_frame,
             text='0 configs loaded',
             font=ctk.CTkFont(size=13, weight='bold')
         )
-        self.link_count_label.grid(row=4, column=0, padx=14, pady=(0, 12), sticky='w')
+        self.link_count_label.grid(row=6, column=0, padx=14, pady=(0, 12), sticky='w')
 
     def _build_setup_card(self):
         self.setup_frame = ctk.CTkFrame(self.main_frame)
@@ -203,6 +246,13 @@ class ConfigScannerApp(ctk.CTk):
         self.timeout_entry = ctk.CTkEntry(self.advanced_frame)
         self.timeout_entry.insert(0, '3000')
         self.timeout_entry.grid(row=1, column=1, padx=10, pady=(0, 10), sticky='ew')
+
+        # Remark: optional override for all config remarks
+        self.remarker_label = ctk.CTkLabel(self.advanced_frame, text='Remark (optional)')
+        self.remarker_label.grid(row=2, column=0, padx=10, pady=(6, 4), sticky='w')
+        self.remarker_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.remarker_var)
+        self.remarker_entry.insert(0, '')
+        self.remarker_entry.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
 
     def _build_progress_card(self):
         self.progress_frame = ctk.CTkFrame(self.main_frame)
@@ -290,6 +340,110 @@ class ConfigScannerApp(ctk.CTk):
         )
         self.export_button.grid(row=1, column=3, padx=(5, 14), pady=(0, 14), sticky='ew')
 
+    def _load_about_info(self):
+        """Read About.md and extract wallet addresses and social links."""
+        # Support running from source and from a PyInstaller bundle
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        base_dir = getattr(sys, '_MEIPASS', None) or script_dir
+        # try several candidate locations for About.md
+        candidates = [
+            os.path.join(base_dir, 'About.md'),
+            os.path.join(base_dir, '..', 'About.md'),
+            os.path.join(script_dir, '..', 'About.md'),
+        ]
+        about_path = None
+        for c in candidates:
+            c = os.path.abspath(c)
+            if os.path.exists(c):
+                about_path = c
+                break
+        info = {'wallets': {}, 'links': {}}
+        if not about_path:
+            return info
+
+        with open(about_path, 'r', encoding='utf-8', errors='ignore') as f:
+            text = f.read()
+
+        # find BTC and TRX addresses (simple key:value patterns)
+        for key in ('BTC', 'TRX'):
+            m = re.search(rf"{key}\s*[:\-]\s*([A-Za-z0-9]+)", text)
+            if m:
+                info['wallets'][key] = m.group(1).strip()
+
+        # fallback: look for long alphanumeric addresses after labels
+        # extract any URLs
+        urls = re.findall(r'(https?://\S+)', text)
+        for u in urls:
+            if 't.me' in u:
+                info['links']['telegram'] = u
+            elif 'instagram' in u or 'instagr' in u:
+                info['links']['instagram'] = u
+            elif 'github' in u:
+                info['links']['github'] = u
+
+        # also try to find Telegram mentions like 'Telegram Chanel: https://t.me/...' or 'Telegram Group : https://t.me/...'
+        # If not found in urls, try simple regex patterns
+        if 'telegram' not in info['links']:
+            m = re.search(r'Telegram[^:\n]*[:\-]\s*(https?://t\.me/\S+)', text, re.IGNORECASE)
+            if m:
+                info['links']['telegram'] = m.group(1).strip()
+        if 'instagram' not in info['links']:
+            m = re.search(r'instagram[^:\n]*[:\-]\s*(https?://\S+)', text, re.IGNORECASE)
+            if m:
+                info['links']['instagram'] = m.group(1).strip()
+        if 'github' not in info['links']:
+            m = re.search(r'github[^:\n]*[:\-]\s*(https?://\S+)', text, re.IGNORECASE)
+            if m:
+                info['links']['github'] = m.group(1).strip()
+
+        return info
+
+    def open_donate_popup(self):
+        # Create a simple popup showing wallets and social links with copy/open actions
+        popup = ctk.CTkToplevel(self)
+        popup.title('Donate')
+        popup.geometry('420x260')
+
+        wallets = self.about_info.get('wallets', {})
+        links = self.about_info.get('links', {})
+
+        row = 0
+        lbl = ctk.CTkLabel(popup, text='Support the project — donate any amount', font=ctk.CTkFont(size=14, weight='bold'))
+        lbl.grid(row=row, column=0, columnspan=3, padx=14, pady=(12, 8), sticky='w')
+        row += 1
+
+        if wallets:
+            for key, addr in wallets.items():
+                k_lbl = ctk.CTkLabel(popup, text=f'{key}:', width=60)
+                k_lbl.grid(row=row, column=0, padx=10, pady=6, sticky='w')
+                a_lbl = ctk.CTkLabel(popup, text=addr, text_color='#aab2bd')
+                a_lbl.grid(row=row, column=1, padx=6, pady=6, sticky='w')
+                copy_btn = ctk.CTkButton(popup, text='Copy', width=60, command=lambda a=addr: (self.clipboard_clear(), self.clipboard_append(a)))
+                copy_btn.grid(row=row, column=2, padx=10, pady=6)
+                row += 1
+        else:
+            no_lbl = ctk.CTkLabel(popup, text='No wallet info found in About.md', text_color='#aab2bd')
+            no_lbl.grid(row=row, column=0, columnspan=3, padx=14, pady=6, sticky='w')
+            row += 1
+
+        # Social links
+        if links:
+            sep = ctk.CTkLabel(popup, text='')
+            sep.grid(row=row, column=0, pady=(6, 0))
+            row += 1
+            for name, url in links.items():
+                n_lbl = ctk.CTkLabel(popup, text=f'{name.capitalize()}:')
+                n_lbl.grid(row=row, column=0, padx=10, pady=4, sticky='w')
+                u_lbl = ctk.CTkLabel(popup, text=url, text_color='#63b3ed')
+                u_lbl.grid(row=row, column=1, padx=6, pady=4, sticky='w')
+                open_btn = ctk.CTkButton(popup, text='Open', width=60, command=lambda u=url: webbrowser.open(u))
+                open_btn.grid(row=row, column=2, padx=10, pady=4)
+                row += 1
+
+        close_btn = ctk.CTkButton(popup, text='Close', command=popup.destroy, fg_color='#3b4252')
+        close_btn.grid(row=row, column=0, columnspan=3, padx=14, pady=(12, 12), sticky='ew')
+
+
     def toggle_advanced_settings(self):
         if self.advanced_visible:
             self.advanced_frame.grid_forget()
@@ -349,9 +503,86 @@ class ConfigScannerApp(ctk.CTk):
         self.dead_label.configure(text=f'Dead: {dead}')
 
     def update_link_count(self):
+        # Update total loaded count
         self.after(0, lambda: self.link_count_label.configure(text=f'{len(self.loaded_links)} configs loaded'))
-        ready_to_scan = bool(self.loaded_links and self.folder_path and self._selected_methods())
+        # keep the listbox in sync
+        self.after(0, lambda: self.refresh_sources_listbox())
+        # update protocol counts display
+        counts = self._compute_protocol_counts()
+        for proto, lbl in getattr(self, 'protocol_count_labels', {}).items():
+            self.after(0, lambda p=proto, l=lbl: l.configure(text=str(counts.get(p, 0))))
+
+        ready_to_scan = bool(self._filtered_loaded_links() and self.folder_path and self._selected_methods())
         self.set_scan_buttons('normal' if ready_to_scan else 'disabled')
+
+    def refresh_sources_listbox(self):
+        try:
+            self.sources_listbox.delete(0, END)
+            for item in sorted(self.loaded_links):
+                proto = self.link_protocols.get(item)
+                display = f'[{proto}] {item}' if proto else item
+                if len(display) > 180:
+                    display = display[:170] + '...'
+                self.sources_listbox.insert(END, display)
+        except Exception:
+            # If listbox not available yet or error occurs, ignore silently
+            pass
+
+    def remove_selected_sources(self):
+        try:
+            selection = list(self.sources_listbox.curselection())
+            if not selection:
+                self.log('No source selected to remove.')
+                return
+            # Map visible indices to sorted loaded_links
+            items = sorted(self.loaded_links)
+            to_remove = [items[i] for i in selection if 0 <= i < len(items)]
+            for item in to_remove:
+                if item in self.loaded_links:
+                    self.loaded_links.remove(item)
+                    if item in self.link_protocols:
+                        self.link_protocols.pop(item, None)
+            self.log(f'Removed {len(to_remove)} selected source(s).')
+            self.update_link_count()
+        except Exception as e:
+            self.log(f'Error removing selected sources: {e}')
+
+    def _compute_protocol_counts(self):
+        counts = {p: 0 for p in self.protocols}
+        # Use cached parsed protocols when available; parse only missing ones
+        for link in list(self.loaded_links):
+            proto = self.link_protocols.get(link)
+            if not proto:
+                try:
+                    parsed = parse_link(link)
+                    proto = parsed.get('proto') if parsed else None
+                except Exception:
+                    proto = None
+                if proto:
+                    self.link_protocols[link] = proto
+            if proto in counts:
+                counts[proto] += 1
+        return counts
+
+    def _filtered_loaded_links(self):
+        # Return subset of loaded_links matching selected protocol checkboxes
+        selected = {p for p, var in self.protocol_vars.items() if var.get() in ('1', 1, True, 'True')}
+        if not selected:
+            return set()
+        result = set()
+        for link in self.loaded_links:
+            proto = self.link_protocols.get(link)
+            if not proto:
+                try:
+                    parsed = parse_link(link)
+                    proto = parsed.get('proto') if parsed else None
+                except Exception:
+                    proto = None
+                if proto:
+                    self.link_protocols[link] = proto
+            if proto in selected:
+                result.add(link)
+        return result
 
     def _selected_methods(self):
         return ['xray'] if self.scan_mode_var.get() == 'Full' else ['fast']
@@ -359,9 +590,22 @@ class ConfigScannerApp(ctk.CTk):
     def _add_links(self, links):
         added_links = 0
         for link in links:
+            try:
+                parsed = parse_link(link)
+                proto = parsed.get('proto') if parsed else None
+            except Exception:
+                proto = None
+
+            # Skip unsupported/excluded protocols like hysteria
+            if proto in ('hysteria', 'hysteria2'):
+                self.log(f'Skipped unsupported protocol: {proto} for {link}')
+                continue
+
             if link not in self.loaded_links:
                 self.loaded_links.add(link)
                 added_links += 1
+                if proto:
+                    self.link_protocols[link] = proto
         return added_links
 
     def add_files(self):
@@ -412,6 +656,7 @@ class ConfigScannerApp(ctk.CTk):
 
     def clear_sources(self):
         self.loaded_links.clear()
+        self.link_protocols.clear()
         self.log('Sources cleared.')
         self.update_link_count()
 
@@ -464,12 +709,12 @@ class ConfigScannerApp(ctk.CTk):
                     self.pause_cond.wait(timeout=0.5)
         return self.scan_state not in ('stopping', 'stopping_save')
 
-    def _dead_result(self, link, reason, method='xray_validation'):
+    def _dead_result(self, link, reason, method='xray_validation', original_remark=''):
         return {
             'method': method,
             'proto': '',
             'link': link,
-            'remark': reason,
+            'remark': original_remark or 'NoRemark',
             'latency': 0,
             'speed': 0.0,
             'success_ratio': 0.0,
@@ -479,8 +724,9 @@ class ConfigScannerApp(ctk.CTk):
         }
 
     def start_scan(self):
-        if not self.loaded_links:
-            self.log('No configs loaded for scanning.')
+        filtered_links = self._filtered_loaded_links()
+        if not filtered_links:
+            self.log('No configs loaded for scanning or no protocol selected.')
             return
         if not self.folder_path:
             self.log('Choose an output folder before starting the scan.')
@@ -510,32 +756,39 @@ class ConfigScannerApp(ctk.CTk):
         self.pause_button.configure(text='Pause', fg_color='#b7791f', hover_color='#975a16')
         self.set_control_buttons('normal', 'normal', 'normal')
 
-        threading.Thread(target=self.run_scan, args=(methods,), daemon=True).start()
-
-    def run_scan(self, methods):
+        # Read GUI inputs on main thread to avoid tkinter access from worker threads
         try:
-            try:
-                max_workers = int(self.threads_entry.get().strip())
-                if max_workers <= 0:
-                    raise ValueError
-            except ValueError:
-                max_workers = 40
-                self.log('Invalid thread count. Using 40.')
+            max_workers = int(self.threads_entry.get().strip())
+            if max_workers <= 0:
+                raise ValueError
+        except Exception:
+            max_workers = 40
+            self.log('Invalid thread count. Using 40.')
 
-            try:
-                timeout_ms = float(self.timeout_entry.get().strip())
-                if timeout_ms <= 0:
-                    raise ValueError
-                timeout = timeout_ms / 1000.0
-            except ValueError:
+        try:
+            timeout_ms = float(self.timeout_entry.get().strip())
+            if timeout_ms <= 0:
+                raise ValueError
+            timeout = timeout_ms / 1000.0
+        except Exception:
+            timeout = 3.0
+            self.log('Invalid timeout. Using 3000ms.')
+
+        threading.Thread(target=self.run_scan, args=(methods, filtered_links, max_workers, timeout), daemon=True).start()
+
+    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0):
+        try:
+            # Ensure defaults if not provided
+            if not max_workers:
+                max_workers = 40
+            if not timeout:
                 timeout = 3.0
-                self.log('Invalid timeout. Using 3000ms.')
 
             if methods and not os.path.exists(self.scanner.xray_path):
                 self.log('xray.exe not found in Core/xray folder.')
                 self.set_status('Scan aborted: xray.exe missing')
                 return
-            unique_links = sorted(self.loaded_links)
+            unique_links = sorted(filtered_links)
             total_links = len(unique_links)
             self.log(f'Processing {total_links} unique configs.')
             selected_method = 'xray' if 'xray' in methods else 'fast'
@@ -562,130 +815,176 @@ class ConfigScannerApp(ctk.CTk):
             fast_links_set = set()
             normal_links_set = set()
 
-            with ThreadPoolExecutor(max_workers=precheck_workers) as executor:
-                futures = {executor.submit(self.scanner.precheck_link, link): link for link in unique_links}
-                for future in as_completed(futures):
-                    if self.scan_state == 'stopping':
-                        self.log('Scan aborted by user. Results discarded.')
-                        break
-                    elif self.scan_state == 'stopping_save':
-                        self.log('Scan stopped by user. Saving completed results.')
-                        break
+            executor = ThreadPoolExecutor(max_workers=precheck_workers)
+            try:
+                        futures = {executor.submit(self.scanner.precheck_link, link): link for link in unique_links}
+                        pending = set(futures.keys())
+                        while pending:
+                            if self.scan_state in ('stopping', 'stopping_save'):
+                                self.log('Stopping precheck loop.')
+                                break
+                            done, not_done = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                            if not done:
+                                # allow pause to be honored
+                                while self.scan_state == 'paused':
+                                    time.sleep(0.2)
+                                continue
 
-                    while self.scan_state == 'paused':
-                        time.sleep(0.2)
+                            for future in list(done):
+                                pending.discard(future)
+                                precheck_done += 1
+                                link = futures[future]
+                                try:
+                                    prechecked = future.result()
+                                except Exception as e:
+                                    prechecked = {'ok': False, 'link': link, 'reason': f'precheck_exception: {e}'}
 
-                    precheck_done += 1
-                    link = futures[future]
-                    try:
-                        prechecked = future.result()
-                    except Exception as e:
-                        prechecked = {'ok': False, 'link': link, 'reason': f'precheck_exception: {e}'}
+                                if prechecked.get('ok'):
+                                    prechecked_items.append(prechecked)
+                                else:
+                                    dead_count += 1
+                                    # Extract original remark if available
+                                    parsed = prechecked.get('parsed')
+                                    orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
+                                    results.append(self._dead_result(link, prechecked.get('reason', 'tcp_precheck_failed'), 'tcp_precheck', orig_remark))
 
-                    if prechecked.get('ok'):
-                        prechecked_items.append(prechecked)
-                    else:
-                        dead_count += 1
-                        results.append(self._dead_result(link, prechecked.get('reason', 'tcp_precheck_failed'), 'tcp_precheck'))
-
-                    pct = (precheck_done / total_links) * 0.15 if total_links else 0
-                    self.set_progress(pct)
-                    self.set_status(f'Prechecked {precheck_done}/{total_links} ({len(prechecked_items)} reachable)')
-                    self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
+                                pct = (precheck_done / total_links) * 0.15 if total_links else 0
+                                self.set_progress(pct)
+                                self.set_status(f'Prechecked {precheck_done}/{total_links} ({len(prechecked_items)} reachable)')
+                                self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
+            finally:
+                executor.shutdown(wait=False, cancel_futures=True)
 
             if self.scan_state not in ('stopping', 'stopping_save'):
                 self.log(f'Precheck complete: {len(prechecked_items)}/{total_links} reachable endpoints.')
 
             validation_total = len(prechecked_items)
             if validation_total and self.scan_state not in ('stopping', 'stopping_save'):
-                with ThreadPoolExecutor(max_workers=validation_workers) as executor:
+                executor = ThreadPoolExecutor(max_workers=validation_workers)
+                try:
                     futures = {executor.submit(self.scanner.validate_prechecked_link, item): item for item in prechecked_items}
-                    for future in as_completed(futures):
-                        if self.scan_state == 'stopping':
-                            self.log('Scan aborted by user. Results discarded.')
+                    pending = set(futures.keys())
+                    while pending:
+                        if self.scan_state in ('stopping', 'stopping_save'):
+                            self.log('Stopping validation loop.')
                             break
-                        elif self.scan_state == 'stopping_save':
-                            self.log('Scan stopped by user. Saving completed results.')
-                            break
+                        done, not_done = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                        if not done:
+                            while self.scan_state == 'paused':
+                                time.sleep(0.2)
+                            continue
 
-                        while self.scan_state == 'paused':
-                            time.sleep(0.2)
+                        for future in list(done):
+                            pending.discard(future)
+                            validation_done += 1
+                            prechecked = futures[future]
+                            link = prechecked['link']
+                            try:
+                                prepared = future.result()
+                            except Exception as e:
+                                prepared = {'ok': False, 'link': link, 'reason': f'validation_exception: {e}'}
 
-                        validation_done += 1
-                        prechecked = futures[future]
-                        link = prechecked['link']
-                        try:
-                            prepared = future.result()
-                        except Exception as e:
-                            prepared = {'ok': False, 'link': link, 'reason': f'validation_exception: {e}'}
+                            if prepared.get('ok'):
+                                prepared_items.append(prepared)
+                            else:
+                                dead_count += 1
+                                # Extract original remark from prechecked parsed data
+                                parsed = prechecked.get('parsed')
+                                orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
+                                results.append(self._dead_result(link, prepared.get('reason', 'xray_validation_failed'), 'xray_validation', orig_remark))
 
-                        if prepared.get('ok'):
-                            prepared_items.append(prepared)
-                        else:
-                            dead_count += 1
-                            results.append(self._dead_result(link, prepared.get('reason', 'xray_validation_failed'), 'xray_validation'))
-
-                        pct = 0.15 + ((validation_done / validation_total) * 0.25 if validation_total else 0)
-                        self.set_progress(pct)
-                        self.set_status(f'Validated {validation_done}/{validation_total} ({len(prepared_items)} Xray-ready)')
-                        self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
+                            pct = 0.15 + ((validation_done / validation_total) * 0.25 if validation_total else 0)
+                            self.set_progress(pct)
+                            self.set_status(f'Validated {validation_done}/{validation_total} ({len(prepared_items)} Xray-ready)')
+                            self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
             if self.scan_state not in ('stopping', 'stopping_save'):
                 self.log(f'Validation complete: {len(prepared_items)}/{len(prechecked_items)} reachable configs accepted.')
 
             real_total = len(prepared_items)
             if real_total and self.scan_state not in ('stopping', 'stopping_save'):
-                with ThreadPoolExecutor(max_workers=real_workers) as executor:
+                executor = ThreadPoolExecutor(max_workers=real_workers)
+                try:
                     futures = {executor.submit(self.scanner.test_prepared_link, item, timeout, selected_method): item for item in prepared_items}
-                    for future in as_completed(futures):
-                        if self.scan_state == 'stopping':
-                            self.log('Scan aborted by user. Results discarded.')
+                    pending = set(futures.keys())
+                    while pending:
+                        if self.scan_state in ('stopping', 'stopping_save'):
+                            self.log('Stopping real-test loop.')
                             break
-                        elif self.scan_state == 'stopping_save':
-                            self.log('Scan stopped by user. Saving completed results.')
-                            break
+                        done, not_done = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
+                        if not done:
+                            while self.scan_state == 'paused':
+                                time.sleep(0.2)
+                            continue
 
-                        while self.scan_state == 'paused':
-                            time.sleep(0.2)
+                        for future in list(done):
+                            pending.discard(future)
+                            real_done += 1
+                            prepared = futures[future]
+                            link = prepared['link']
+                            try:
+                                item = future.result()
+                            except Exception as e:
+                                item = None
+                                # Extract original remark from prepared data
+                                parsed = prepared.get('parsed')
+                                orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
+                                results.append(self._dead_result(link, f'real_test_exception: {e}', selected_method, orig_remark))
 
-                        real_done += 1
-                        prepared = futures[future]
-                        link = prepared['link']
-                        try:
-                            item = future.result()
-                        except Exception as e:
-                            item = None
-                            results.append(self._dead_result(link, f'real_test_exception: {e}', selected_method))
-
-                        if item:
-                            results.append(item)
-                            classification = item.get('classification', 'dead')
-                            if classification == 'fast':
-                                fast_count += 1
-                                fast_links_set.add(link)
-                            elif classification == 'medium':
-                                medium_count += 1
-                                normal_links_set.add(link)
-                            elif classification == 'slow':
-                                slow_count += 1
-                                normal_links_set.add(link)
+                            if item:
+                                results.append(item)
+                                classification = item.get('classification', 'dead')
+                                if classification == 'fast':
+                                    fast_count += 1
+                                    fast_links_set.add(link)
+                                elif classification == 'medium':
+                                    medium_count += 1
+                                    normal_links_set.add(link)
+                                elif classification == 'slow':
+                                    slow_count += 1
+                                    normal_links_set.add(link)
+                                else:
+                                    dead_count += 1
+                                active_links.add(link)
                             else:
                                 dead_count += 1
-                            active_links.add(link)
-                        else:
-                            dead_count += 1
-                            if not any(result.get('link') == link and result.get('classification') == 'dead' for result in results):
-                                results.append(self._dead_result(link, 'connectivity_or_speed_failed', selected_method))
+                                if not any(result.get('link') == link and result.get('classification') == 'dead' for result in results):
+                                    # Extract original remark from prepared data
+                                    parsed = prepared.get('parsed')
+                                    orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
+                                    results.append(self._dead_result(link, 'connectivity_or_speed_failed', selected_method, orig_remark))
 
-                        pct = 0.40 + ((real_done / real_total) * 0.60 if real_total else 0)
-                        self.set_progress(pct)
-                        self.set_status(f'Tested {real_done}/{real_total} ready configs')
-                        self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
+                            pct = 0.40 + ((real_done / real_total) * 0.60 if real_total else 0)
+                            self.set_progress(pct)
+                            self.set_status(f'Tested {real_done}/{real_total} ready configs')
+                            self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
+                finally:
+                    executor.shutdown(wait=False, cancel_futures=True)
 
             if self.scan_state != 'stopping':
                 self.fast_links = sorted(fast_links_set)
                 self.normal_links = sorted(normal_links_set)
                 self.active_links = sorted(active_links)
+                
+                # Apply Remark override if provided before saving
+                try:
+                    rem = self.remarker_var.get().strip() if hasattr(self, 'remarker_var') else ''
+                except Exception as e:
+                    rem = ''
+                    self.log(f'Error reading Remark field: {e}')
+                
+                if not rem:
+                    self.log('No Remark override provided. Using original remarks.')
+                else:
+                    self.log(f'Applying Remark override: "{rem}" to all {len(results)} results.')
+                    if results:
+                        for item in results:
+                            item['remark'] = rem
+                    else:
+                        self.log('No results to apply Remark override to.')
+                
                 self.save_results(results)
                 self.log('')
                 self.log('Scan complete.')
@@ -735,7 +1034,13 @@ class ConfigScannerApp(ctk.CTk):
             file_base = f'{classification}_verified.txt' if classification != 'dead' else 'dead.txt'
             file_path = os.path.join(output_dir, file_base)
             with open(file_path, 'w', encoding='utf-8') as f:
-                f.write('\n'.join([item['link'] for item in items]))
+                # Format: link | remark
+                for item in items:
+                    remark = item.get('remark', '')
+                    if remark and remark != 'NoRemark':
+                        f.write(f"{item['link']} | {remark}\n")
+                    else:
+                        f.write(f"{item['link']}\n")
             self.log(f'Saved {file_base}')
 
     def export_active_links(self):
@@ -743,15 +1048,25 @@ class ConfigScannerApp(ctk.CTk):
         if not active:
             self.log('No active configs are available to export.')
             return
-        if not self.folder_path:
-            self.log('Choose an output folder before exporting.')
+        
+        # Ask user for export file location
+        file_path = filedialog.asksaveasfilename(
+            defaultextension='.txt',
+            filetypes=[('Text files', '*.txt'), ('All files', '*.*')],
+            initialfile='active_configs.txt'
+        )
+        
+        if not file_path:
+            self.log('Export cancelled.')
             return
-        output_dir = os.path.join(self.folder_path, 'Scan_Results')
-        os.makedirs(output_dir, exist_ok=True)
-        file_path = os.path.join(output_dir, 'active_connected_configs.txt')
-        with open(file_path, 'w', encoding='utf-8') as f:
-            f.write('\n'.join(active))
-        self.log(f'Exported active configs to {os.path.basename(file_path)}.')
+        
+        try:
+            with open(file_path, 'w', encoding='utf-8') as f:
+                # Export only the links (standard format for Xray configs)
+                f.write('\n'.join(active))
+            self.log(f'Exported {len(active)} active configs to {os.path.basename(file_path)}.')
+        except Exception as e:
+            self.log(f'Error exporting configs: {e}')
 
     def copy_fast(self):
         if self.fast_links:
