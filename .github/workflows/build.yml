@@ -30,15 +30,33 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller --noconfirm ScanV2Ray.spec
 
+      - name: Version the binary
+        id: name
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF}" == refs/tags/v* ]]; then
+            VER="${GITHUB_REF_NAME#v}"
+          else
+            VER="dev-${GITHUB_SHA::7}"
+          fi
+          cp dist/ScanV2Ray.exe "dist/ScanV2Ray-${VER}.exe"
+          echo "version=${VER}" >> "$GITHUB_OUTPUT"
+          echo "asset=dist/ScanV2Ray-${VER}.exe" >> "$GITHUB_OUTPUT"
+
       - name: Upload build artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ScanV2Ray-exe
-          path: dist/ScanV2Ray.exe
+          name: ScanV2Ray-${{ steps.name.outputs.version }}
+          path: ${{ steps.name.outputs.asset }}
           if-no-files-found: error
 
       - name: Publish release (on tag)
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/ScanV2Ray.exe
+          name: ScanV2Ray ${{ steps.name.outputs.version }}
+          tag_name: ${{ github.ref_name }}
+          files: ${{ steps.name.outputs.asset }}
+          fail_on_unmatched_files: true
+          # Each tag is its own release; softprops never touches other tags,
+          # so previous versions stay downloadable under Releases forever.
