@@ -4,7 +4,7 @@ import os
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
-from tkinter import filedialog, StringVar, Listbox, END
+from tkinter import filedialog, StringVar, BooleanVar, Listbox, END
 
 import customtkinter as ctk
 import re
@@ -50,6 +50,7 @@ class ConfigScannerApp(ctk.CTk):
 
         self.scan_mode_var = StringVar(value='Quick')
         self.remarker_var = StringVar(value='')
+        self.ultra_scan_var = BooleanVar(value=False)
 
         self._build_ui()
         # Load About.md info for Donate popup
@@ -201,13 +202,21 @@ class ConfigScannerApp(ctk.CTk):
         self.mode_selector.grid(row=2, column=0, padx=14, pady=(0, 12), sticky='ew')
         self.mode_selector.set('Quick')
 
+        self.ultra_switch = ctk.CTkSwitch(
+            self.setup_frame,
+            text='⚡ Ultra Scan (faster real-test • more CPU/network)',
+            variable=self.ultra_scan_var,
+            onvalue=True, offvalue=False
+        )
+        self.ultra_switch.grid(row=3, column=0, padx=14, pady=(0, 12), sticky='w')
+
         self.select_button = ctk.CTkButton(
             self.setup_frame,
             text='Choose output folder',
             command=self.select_folder,
             font=ctk.CTkFont(weight='bold')
         )
-        self.select_button.grid(row=3, column=0, padx=14, pady=(0, 8), sticky='ew')
+        self.select_button.grid(row=4, column=0, padx=14, pady=(0, 8), sticky='ew')
 
         self.folder_label = ctk.CTkLabel(
             self.setup_frame,
@@ -216,7 +225,7 @@ class ConfigScannerApp(ctk.CTk):
             wraplength=360,
             justify='left'
         )
-        self.folder_label.grid(row=4, column=0, padx=14, pady=(0, 12), sticky='w')
+        self.folder_label.grid(row=5, column=0, padx=14, pady=(0, 12), sticky='w')
 
         self.start_button = ctk.CTkButton(
             self.setup_frame,
@@ -226,7 +235,7 @@ class ConfigScannerApp(ctk.CTk):
             height=40,
             font=ctk.CTkFont(size=14, weight='bold')
         )
-        self.start_button.grid(row=5, column=0, padx=14, pady=(0, 10), sticky='ew')
+        self.start_button.grid(row=6, column=0, padx=14, pady=(0, 10), sticky='ew')
 
         self.advanced_button = ctk.CTkButton(
             self.setup_frame,
@@ -235,7 +244,7 @@ class ConfigScannerApp(ctk.CTk):
             fg_color='#3b4252',
             hover_color='#4c566a'
         )
-        self.advanced_button.grid(row=6, column=0, padx=14, pady=(0, 10), sticky='ew')
+        self.advanced_button.grid(row=7, column=0, padx=14, pady=(0, 10), sticky='ew')
 
         self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color='#232936')
         self.advanced_frame.grid_columnconfigure((0, 1), weight=1)
@@ -454,7 +463,7 @@ class ConfigScannerApp(ctk.CTk):
             self.advanced_frame.grid_forget()
             self.advanced_button.configure(text='Show advanced settings')
         else:
-            self.advanced_frame.grid(row=7, column=0, padx=14, pady=(0, 14), sticky='ew')
+            self.advanced_frame.grid(row=8, column=0, padx=14, pady=(0, 14), sticky='ew')
             self.advanced_button.configure(text='Hide advanced settings')
         self.advanced_visible = not self.advanced_visible
 
@@ -800,9 +809,16 @@ class ConfigScannerApp(ctk.CTk):
             remark_override = ''
             self.log(f'Error reading Remark field: {e}')
 
-        threading.Thread(target=self.run_scan, args=(methods, filtered_links, max_workers, timeout), kwargs={'remark_override': remark_override}, daemon=True).start()
+        # Read the Ultra Scan flag on the main thread (Tk access is not thread-safe)
+        try:
+            ultra_scan = bool(self.ultra_scan_var.get())
+        except Exception as e:
+            ultra_scan = False
+            self.log(f'Error reading Ultra Scan flag: {e}')
 
-    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0, remark_override=None):
+        threading.Thread(target=self.run_scan, args=(methods, filtered_links, max_workers, timeout), kwargs={'remark_override': remark_override, 'ultra': ultra_scan}, daemon=True).start()
+
+    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0, remark_override=None, ultra=False):
         try:
             # Ensure defaults if not provided
             if not max_workers:
@@ -820,11 +836,17 @@ class ConfigScannerApp(ctk.CTk):
             selected_method = 'xray' if 'xray' in methods else 'fast'
             precheck_workers = min(max_workers * 4, 200)
             validation_workers = min(max_workers, 80)
-            real_workers = min(max_workers, 12)
-            self.scanner.set_speed_test_limit(min(real_workers, 6))
+            if ultra:
+                real_workers = min(max_workers, 48)
+                speed_limit = min(real_workers, 24)
+            else:
+                real_workers = min(max_workers, 12)
+                speed_limit = min(real_workers, 6)
+            self.scanner.set_speed_test_limit(speed_limit)
             self.log(
                 f'Pipeline: precheck workers={precheck_workers}, validation workers={validation_workers}, '
-                f'real-test workers={real_workers}, mode={selected_method}.'
+                f'real-test workers={real_workers}, speed-test slots={speed_limit}, '
+                f'mode={selected_method}, ultra={"on" if ultra else "off"}.'
             )
 
             results = []
