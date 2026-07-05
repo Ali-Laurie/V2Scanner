@@ -32,6 +32,10 @@ class Scanner:
         self._active_procs = set()
         self._proc_lock = threading.Lock()
         self._aborted = False
+        # Set by ui.run_scan before each scan (features A and B).
+        self.detect_country = False
+        self.site_check = False
+        self.site_targets = []
 
     def request_abort(self):
         # mark aborted and kill every currently-running xray process immediately
@@ -191,7 +195,13 @@ class Scanner:
             'https://www.google.com/generate_204'
         ]
         if quick:
-            endpoints = endpoints[:2]
+            # Probe the cloudflare trace first when we want exit country, so the
+            # `if quick: break` after the first success still reads the trace body.
+            if self.detect_country:
+                endpoints = ['https://www.cloudflare.com/cdn-cgi/trace',
+                             'https://www.gstatic.com/generate_204']
+            else:
+                endpoints = endpoints[:2]
         endpoint_timeout = min(timeout, 2.5) if quick else timeout
 
         metrics = {
@@ -200,7 +210,10 @@ class Scanner:
             'latencies': [],
             'first_response_ms': None,
             'download_kbps': 0.0,
-            'error_count': 0
+            'error_count': 0,
+            'exit_ip': '',
+            'exit_country': '',
+            'sites_ok': []
         }
 
         for endpoint in endpoints:
@@ -218,12 +231,41 @@ class Scanner:
                         metrics['latencies'].append(elapsed)
                         if metrics['first_response_ms'] is None:
                             metrics['first_response_ms'] = elapsed
+                        # Feature A: parse exit ip/country from the cloudflare trace body.
+                        if (self.detect_country and status == 200
+                                and 'cdn-cgi/trace' in endpoint
+                                and not metrics['exit_ip'] and not metrics['exit_country']):
+                            try:
+                                body = response.read(4096).decode('utf-8', errors='ignore')
+                                for line in body.splitlines():
+                                    if line.startswith('ip='):
+                                        metrics['exit_ip'] = line[3:].strip()
+                                    elif line.startswith('loc='):
+                                        metrics['exit_country'] = line[4:].strip()
+                            except Exception:
+                                pass
                         if quick:
                             break
                     else:
                         metrics['error_count'] += 1
             except Exception:
                 metrics['error_count'] += 1
+
+        # Feature B: site reachability probes, only for connectable configs.
+        if (self.site_check and self.site_targets and metrics['successes'] > 0
+                and not self._aborted):
+            site_timeout = min(timeout, 3.0)
+            for name, url in self.site_targets:
+                if self._aborted:
+                    break
+                try:
+                    site_req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
+                    with opener.open(site_req, timeout=site_timeout) as site_resp:
+                        site_status = site_resp.getcode()
+                        if site_status is None or site_status < 400:
+                            metrics['sites_ok'].append(name)
+                except Exception:
+                    pass
 
         # success_ratio reflects the connectivity PROBE requests only, so it
         # means the same thing on both the early-return and full paths. The
@@ -301,7 +343,10 @@ class Scanner:
             'success_ratio': round(metrics.get('success_ratio', 0.0), 2),
             'average_latency': metrics.get('average_latency'),
             'score': score,
-            'classification': classification
+            'classification': classification,
+            'exit_ip': metrics.get('exit_ip', ''),
+            'exit_country': metrics.get('exit_country', ''),
+            'sites_ok': metrics.get('sites_ok', [])
         }
 
     def _build_config(self, parsed, local_port, engine):

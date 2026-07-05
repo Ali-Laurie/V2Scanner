@@ -17,8 +17,8 @@ def _is_ip_literal(value):
     except ValueError:
         return False
 
-SUPPORTED_PROTOCOLS = ('vmess', 'vless', 'trojan', 'ss', 'hysteria', 'hysteria2')
-LINK_RE = re.compile(r'(vmess://[^\s\'\"]+|vless://[^\s\'\"]+|trojan://[^\s\'\"]+|ss://[^\s\'\"]+|hysteria2?://[^\s\'\"]+)')
+SUPPORTED_PROTOCOLS = ('vmess', 'vless', 'trojan', 'ss', 'hysteria', 'hysteria2', 'socks', 'http')
+LINK_RE = re.compile(r'(vmess://[^\s\'\"]+|vless://[^\s\'\"]+|trojan://[^\s\'\"]+|ss://[^\s\'\"]+|hysteria2?://[^\s\'\"]+|socks://[^\s\'\"]+|http://[^\s\'\"]+)')
 UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 SUPPORTED_SS_METHODS = {
     'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
@@ -223,19 +223,41 @@ def parse_generic(link):
                     except Exception:
                         credentials = ''
             else:
+                if p.password is not None:
+                    credentials = '{}:{}'.format(unquote(p.username or ''), unquote(p.password or ''))
+                else:
+                    userinfo = unquote(p.username or '')
+                    if ':' in userinfo:
+                        credentials = userinfo
+                    else:
+                        try:
+                            raw = p.username or ''
+                            missing_padding = len(raw) % 4
+                            if missing_padding:
+                                raw += '=' * (4 - missing_padding)
+                            decoded = base64.b64decode(raw).decode('utf-8', errors='ignore')
+                            credentials = decoded if ':' in decoded else userinfo
+                        except Exception:
+                            credentials = userinfo
+        elif proto in ('socks', 'http'):
+            if p.password is not None:
+                credentials = '{}:{}'.format(unquote(p.username or ''), unquote(p.password or ''))
+            else:
                 userinfo = unquote(p.username or '')
                 if ':' in userinfo:
                     credentials = userinfo
-                else:
+                elif userinfo:
                     try:
-                        raw = userinfo
+                        raw = p.username or ''
                         missing_padding = len(raw) % 4
                         if missing_padding:
                             raw += '=' * (4 - missing_padding)
                         decoded = base64.b64decode(raw).decode('utf-8', errors='ignore')
-                        credentials = decoded if ':' in decoded else userinfo
+                        credentials = decoded if ':' in decoded else ''
                     except Exception:
-                        credentials = userinfo
+                        credentials = ''
+                else:
+                    credentials = ''
         else:
             credentials = unquote(p.username or '')
             if proto == 'trojan' and not credentials:
@@ -286,6 +308,7 @@ def parse_generic(link):
         insecure = q.get('insecure', [''])[0]
         short_id = q.get('sid', [''])[0]
         spider_x = q.get('spx', [''])[0]
+        plugin = q.get('plugin', [''])[0]
 
         extra = {
             'alpn': alpn,
@@ -305,6 +328,7 @@ def parse_generic(link):
             'insecure': insecure,
             'sid': short_id,
             'spx': spider_x,
+            'plugin': plugin,
         }
         extra = {k: v for k, v in extra.items() if v}
 

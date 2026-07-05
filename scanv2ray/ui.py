@@ -52,6 +52,10 @@ class ConfigScannerApp(ctk.CTk):
         self.scan_mode_var = StringVar(value='Quick')
         self.remarker_var = StringVar(value='')
         self.ultra_scan_var = BooleanVar(value=False)
+        self.detect_country_var = BooleanVar(value=True)
+        self.retry_failed_var = BooleanVar(value=False)
+        self.site_check_var = BooleanVar(value=False)
+        self.dedupe_var = BooleanVar(value=True)
 
         self._build_ui()
         # Load About.md info for Donate popup
@@ -161,7 +165,7 @@ class ConfigScannerApp(ctk.CTk):
         self.clear_sources_btn.grid(row=0, column=3, padx=5, sticky='ew')
 
         # Protocol filters and counts
-        self.protocols = ['vmess', 'vless', 'ss', 'trojan']
+        self.protocols = ['vmess', 'vless', 'ss', 'trojan', 'socks', 'http']
         self.protocol_vars = {p: StringVar(value='1') for p in self.protocols}
         self.protocol_count_labels = {}
 
@@ -268,6 +272,39 @@ class ConfigScannerApp(ctk.CTk):
         self.remarker_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.remarker_var)
         self.remarker_entry.insert(0, '')
         self.remarker_entry.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
+
+        # Feature toggles (each independently switchable)
+        self.detect_country_switch = ctk.CTkSwitch(
+            self.advanced_frame,
+            text='Detect exit country',
+            variable=self.detect_country_var,
+            onvalue=True, offvalue=False
+        )
+        self.detect_country_switch.grid(row=4, column=0, padx=10, pady=(4, 4), sticky='w')
+
+        self.retry_failed_switch = ctk.CTkSwitch(
+            self.advanced_frame,
+            text='Retry failed once',
+            variable=self.retry_failed_var,
+            onvalue=True, offvalue=False
+        )
+        self.retry_failed_switch.grid(row=4, column=1, padx=10, pady=(4, 4), sticky='w')
+
+        self.site_check_switch = ctk.CTkSwitch(
+            self.advanced_frame,
+            text='Check site reachability',
+            variable=self.site_check_var,
+            onvalue=True, offvalue=False
+        )
+        self.site_check_switch.grid(row=5, column=0, padx=10, pady=(4, 10), sticky='w')
+
+        self.dedupe_switch = ctk.CTkSwitch(
+            self.advanced_frame,
+            text='Remove duplicates',
+            variable=self.dedupe_var,
+            onvalue=True, offvalue=False
+        )
+        self.dedupe_switch.grid(row=5, column=1, padx=10, pady=(4, 10), sticky='w')
 
     def _build_progress_card(self):
         self.progress_frame = ctk.CTkFrame(self.main_frame)
@@ -746,7 +783,10 @@ class ConfigScannerApp(ctk.CTk):
             'average_latency': '',
             'score': 0.0,
             'classification': 'dead',
-            'reason': reason
+            'reason': reason,
+            'exit_ip': '',
+            'exit_country': '',
+            'sites_ok': []
         }
 
     def start_scan(self):
@@ -817,9 +857,44 @@ class ConfigScannerApp(ctk.CTk):
             ultra_scan = False
             self.log(f'Error reading Ultra Scan flag: {e}')
 
-        threading.Thread(target=self.run_scan, args=(methods, filtered_links, max_workers, timeout), kwargs={'remark_override': remark_override, 'ultra': ultra_scan}, daemon=True).start()
+        # Read the four feature toggles on the main thread (Tk access is not thread-safe)
+        try:
+            detect_country = bool(self.detect_country_var.get())
+        except Exception as e:
+            detect_country = True
+            self.log(f'Error reading Detect exit country flag: {e}')
+        try:
+            retry_failed = bool(self.retry_failed_var.get())
+        except Exception as e:
+            retry_failed = False
+            self.log(f'Error reading Retry failed once flag: {e}')
+        try:
+            site_check = bool(self.site_check_var.get())
+        except Exception as e:
+            site_check = False
+            self.log(f'Error reading Check site reachability flag: {e}')
+        try:
+            dedupe = bool(self.dedupe_var.get())
+        except Exception as e:
+            dedupe = True
+            self.log(f'Error reading Remove duplicates flag: {e}')
 
-    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0, remark_override=None, ultra=False):
+        threading.Thread(
+            target=self.run_scan,
+            args=(methods, filtered_links, max_workers, timeout),
+            kwargs={
+                'remark_override': remark_override,
+                'ultra': ultra_scan,
+                'detect_country': detect_country,
+                'retry_failed': retry_failed,
+                'site_check': site_check,
+                'dedupe': dedupe,
+            },
+            daemon=True
+        ).start()
+
+    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0, remark_override=None, ultra=False,
+                 detect_country=True, retry_failed=False, site_check=False, dedupe=True):
         try:
             # Ensure defaults if not provided
             if not max_workers:
@@ -830,11 +905,29 @@ class ConfigScannerApp(ctk.CTk):
             # Reset any prior abort flag before starting fresh work
             self.scanner.reset_abort()
 
+            # Configure scanner-driven features for this run
+            self.scanner.detect_country = detect_country
+            self.scanner.site_check = site_check
+            self.scanner.site_targets = [
+                ('youtube', 'https://www.youtube.com'),
+                ('instagram', 'https://www.instagram.com'),
+                ('telegram', 'https://web.telegram.org'),
+                ('chatgpt', 'https://chatgpt.com'),
+            ] if site_check else []
+
             if methods and not os.path.exists(self.scanner.xray_path):
                 self.log('xray.exe not found in Core/xray folder.')
                 self.set_status('Scan aborted: xray.exe missing')
                 return
             unique_links = sorted(filtered_links)
+
+            # Optionally drop duplicate configs (same normalized identity)
+            if dedupe:
+                before = len(unique_links)
+                unique_links = engine.dedupe_links(unique_links, parse_link)
+                removed = before - len(unique_links)
+                self.log(f'Dedupe removed {removed} duplicate config(s).')
+
             total_links = len(unique_links)
             self.log(f'Processing {total_links} unique configs.')
             selected_method = 'xray' if 'xray' in methods else 'fast'
@@ -929,7 +1022,7 @@ class ConfigScannerApp(ctk.CTk):
                 precheck_workers=precheck_workers, test_workers=test_workers,
                 should_stop=should_stop, wait_if_paused=wait_if_paused,
                 report_precheck=report_precheck, report_dead=report_dead,
-                report_test=report_test,
+                report_test=report_test, retry_failed=retry_failed,
             )
 
             if self.scan_state not in ('stopping', 'stopping_save'):
@@ -998,7 +1091,8 @@ class ConfigScannerApp(ctk.CTk):
                 writer = csv.writer(f)
                 writer.writerow([
                     'method', 'proto', 'link', 'remark', 'latency_ms', 'speed_kbps',
-                    'success_ratio', 'average_latency_ms', 'score', 'classification', 'reason'
+                    'success_ratio', 'average_latency_ms', 'score', 'classification', 'reason',
+                    'exit_ip', 'exit_country', 'sites_ok'
                 ])
                 for item in results:
                     writer.writerow([
@@ -1013,6 +1107,9 @@ class ConfigScannerApp(ctk.CTk):
                         self._csv_safe(item['score']),
                         self._csv_safe(item['classification']),
                         self._csv_safe(item.get('reason', '')),
+                        self._csv_safe(item.get('exit_ip', '')),
+                        self._csv_safe(item.get('exit_country', '')),
+                        self._csv_safe(';'.join(item.get('sites_ok', []) or [])),
                     ])
             self.log('Saved scan_results.csv')
 

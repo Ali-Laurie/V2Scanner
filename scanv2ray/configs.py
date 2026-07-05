@@ -152,6 +152,30 @@ def make_xray_config(parsed, local_port):
                 }
             ]
         }
+    elif parsed['proto'] == 'socks':
+        server_obj = {
+            'address': parsed['host'],
+            'port': parsed['port']
+        }
+        creds = parsed.get('credentials') or ''
+        if ':' in creds:
+            user, password = creds.split(':', 1)
+            server_obj['users'] = [{'user': user, 'pass': password}]
+        outbound['settings'] = {
+            'servers': [server_obj]
+        }
+    elif parsed['proto'] == 'http':
+        server_obj = {
+            'address': parsed['host'],
+            'port': parsed['port']
+        }
+        creds = parsed.get('credentials') or ''
+        if ':' in creds:
+            user, password = creds.split(':', 1)
+            server_obj['users'] = [{'user': user, 'pass': password}]
+        outbound['settings'] = {
+            'servers': [server_obj]
+        }
     elif parsed['proto'] in ('hysteria', 'hysteria2'):
         extra = parsed.get('extra', {}) or {}
         server_obj = {

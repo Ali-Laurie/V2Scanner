@@ -1,9 +1,45 @@
 from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 
+def dedupe_links(links, parse_link):
+    """
+    Return a de-duplicated list of links preserving first-occurrence order.
+
+    Duplicate KEY = a normalized identity from parse_link(link):
+    (proto, host, port, credentials, transport_type, security_mode). Links whose
+    parse returns None (or raises) keep their raw string as the key, so
+    unparseable links are still deduped by exact text and never dropped merely
+    for being unparseable. parse_link is injected to avoid import coupling.
+    """
+    seen = set()
+    out = []
+    for link in links:
+        try:
+            parsed = parse_link(link)
+        except Exception:
+            parsed = None
+        if parsed:
+            key = (
+                parsed.get('proto'),
+                parsed.get('host'),
+                parsed.get('port'),
+                parsed.get('credentials'),
+                parsed.get('transport_type'),
+                parsed.get('security_mode'),
+            )
+        else:
+            key = link
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(link)
+    return out
+
+
 def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_workers,
                  should_stop, wait_if_paused,
-                 report_precheck, report_dead, report_test):
+                 report_precheck, report_dead, report_test,
+                 retry_failed=False):
     """
     Streaming precheck -> (validate+realtest) pipeline with a bounded rolling test pool.
     Peak concurrent xray == test_workers (each test worker holds at most one long-running
@@ -34,6 +70,7 @@ def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_work
     pending_pre = set()
     pre_link = {}       # future -> original link (survives wait() reassigning pending_pre)
     pending_test = {}   # future -> item
+    retried = set()     # id(item) of items already resubmitted once (feature C)
     stopped = False
 
     def _finish_test(fut):
@@ -45,6 +82,13 @@ def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_work
             result = fut.result()
         except Exception:
             result = None
+        # Feature C: on the first failure, resubmit once instead of finalizing.
+        # Do NOT increment test_done or report for this deferred failure.
+        if result is None and retry_failed and not stopped and id(item) not in retried:
+            retried.add(id(item))
+            tf = test_pool.submit(scanner.validate_and_test, item, timeout, method)
+            pending_test[tf] = item
+            return
         test_done += 1
         if result is None:
             report_dead(link, parsed, 'connectivity_or_speed_failed', 'test')
