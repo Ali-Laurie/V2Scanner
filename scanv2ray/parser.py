@@ -1,8 +1,21 @@
 import base64
+import ipaddress
 import json
 import re
 import urllib.request
 from urllib.parse import urlparse, unquote, parse_qs
+
+MAX_SUBSCRIPTION_BYTES = 5 * 1024 * 1024
+
+
+def _is_ip_literal(value):
+    if not value:
+        return False
+    try:
+        ipaddress.ip_address(value.strip('[]'))
+        return True
+    except ValueError:
+        return False
 
 SUPPORTED_PROTOCOLS = ('vmess', 'vless', 'trojan', 'ss', 'hysteria', 'hysteria2')
 LINK_RE = re.compile(r'(vmess://[^\s\'\"]+|vless://[^\s\'\"]+|trojan://[^\s\'\"]+|ss://[^\s\'\"]+|hysteria2?://[^\s\'\"]+)')
@@ -26,7 +39,7 @@ def try_decode_base64_content(content):
         decoded = base64.b64decode(clean_content).decode('utf-8', errors='ignore')
         if LINK_RE.search(decoded):
             return decoded
-        return decoded
+        return content
     except Exception:
         return content
 
@@ -55,8 +68,11 @@ def extract_links_from_json(payload):
 
 def fetch_subscription_source(source):
     try:
+        scheme = urlparse(source).scheme.lower()
+        if scheme not in ('http', 'https'):
+            return []
         with urllib.request.urlopen(source, timeout=15) as response:
-            raw = response.read()
+            raw = response.read(MAX_SUBSCRIPTION_BYTES)
             text = raw.decode('utf-8', errors='ignore')
             decoded = try_decode_base64_content(text)
             links = extract_links(decoded)
@@ -116,7 +132,7 @@ def parse_vmess(link):
         tls_val = str(data.get('tls', '')).lower()
         security_mode = tls_val if tls_val in ['tls', 'xtls'] else ('tls' if port == 443 else 'none')
         is_tls = security_mode in ['tls', 'xtls']
-        sni = data.get('sni') or data.get('host') or host
+        sni = data.get('sni') or data.get('host') or ('' if _is_ip_literal(host) else host)
 
         credentials = data.get('id')
         transport_type = data.get('net', data.get('type', 'tcp')).lower()
@@ -292,7 +308,7 @@ def parse_generic(link):
         }
         extra = {k: v for k, v in extra.items() if v}
 
-        sni = q.get('sni', [''])[0] or host_header or host
+        sni = q.get('sni', [''])[0] or host_header or ('' if _is_ip_literal(host) else host)
 
         return {
             'proto': proto,

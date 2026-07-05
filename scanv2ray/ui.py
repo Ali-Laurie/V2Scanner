@@ -1,3 +1,4 @@
+import csv
 import json
 import os
 import threading
@@ -36,14 +37,18 @@ class ConfigScannerApp(ctk.CTk):
         self.log_lock = threading.Lock()
         self.log_queue = []
         self.log_scheduled = False
+        self.log_filepath = None
         self.advanced_visible = False
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        xray_path = os.path.join(script_dir, '..', 'Core', 'xray', 'xray.exe')
-        singbox_path = os.path.join(script_dir, '..', 'Core', 'sing_box', 'sing-box.exe')
+        if getattr(sys, 'frozen', False):
+            base_dir = sys._MEIPASS
+        else:
+            base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        xray_path = os.path.join(base_dir, 'Core', 'xray', 'xray.exe')
+        singbox_path = os.path.join(base_dir, 'Core', 'sing_box', 'sing-box.exe')
         self.scanner = Scanner(xray_path, singbox_path)
 
-        self.scan_mode_var = StringVar(value='Fast')
+        self.scan_mode_var = StringVar(value='Quick')
         self.remarker_var = StringVar(value='')
 
         self._build_ui()
@@ -470,6 +475,16 @@ class ConfigScannerApp(ctk.CTk):
             self.box.insert('end', line + '\n')
         self.box.see('end')
 
+        # Persist log lines to scan_log.txt (thread-safe via log_lock)
+        if self.log_filepath and lines:
+            try:
+                with self.log_lock:
+                    with open(self.log_filepath, 'a', encoding='utf-8') as f:
+                        for line in lines:
+                            f.write(line + '\n')
+            except Exception:
+                pass
+
     def set_status(self, text):
         self.after(0, lambda: self.status.configure(text=text))
 
@@ -720,7 +735,8 @@ class ConfigScannerApp(ctk.CTk):
             'success_ratio': 0.0,
             'average_latency': '',
             'score': 0.0,
-            'classification': 'dead'
+            'classification': 'dead',
+            'reason': reason
         }
 
     def start_scan(self):
@@ -737,12 +753,15 @@ class ConfigScannerApp(ctk.CTk):
             return
 
         self.box.delete('1.0', 'end')
+        self.log_filepath = None
         if self.folder_path:
             log_dir = os.path.join(self.folder_path, 'Scan_Results')
             os.makedirs(log_dir, exist_ok=True)
             log_filepath = os.path.join(log_dir, 'scan_log.txt')
             with open(log_filepath, 'w', encoding='utf-8') as f:
                 f.write(f'=== ScanV2Ray LOG STARTED AT {time.strftime("%Y-%m-%d %H:%M:%S")} ===\n')
+            # Store the path so log lines get persisted to disk during the scan
+            self.log_filepath = log_filepath
 
         self.log('Starting scan...')
         self.set_progress(0)
@@ -774,9 +793,16 @@ class ConfigScannerApp(ctk.CTk):
             timeout = 3.0
             self.log('Invalid timeout. Using 3000ms.')
 
-        threading.Thread(target=self.run_scan, args=(methods, filtered_links, max_workers, timeout), daemon=True).start()
+        # Read the Remark override on the main thread (Tk access is not thread-safe)
+        try:
+            remark_override = self.remarker_var.get().strip()
+        except Exception as e:
+            remark_override = ''
+            self.log(f'Error reading Remark field: {e}')
 
-    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0):
+        threading.Thread(target=self.run_scan, args=(methods, filtered_links, max_workers, timeout), kwargs={'remark_override': remark_override}, daemon=True).start()
+
+    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0, remark_override=None):
         try:
             # Ensure defaults if not provided
             if not max_workers:
@@ -969,12 +995,8 @@ class ConfigScannerApp(ctk.CTk):
                 self.active_links = sorted(active_links)
                 
                 # Apply Remark override if provided before saving
-                try:
-                    rem = self.remarker_var.get().strip() if hasattr(self, 'remarker_var') else ''
-                except Exception as e:
-                    rem = ''
-                    self.log(f'Error reading Remark field: {e}')
-                
+                rem = (remark_override or '').strip()
+
                 if not rem:
                     self.log('No Remark override provided. Using original remarks.')
                 else:
@@ -1001,6 +1023,14 @@ class ConfigScannerApp(ctk.CTk):
             self.set_control_buttons('disabled', 'disabled', 'disabled')
             self.scan_state = 'idle'
 
+    @staticmethod
+    def _csv_safe(value):
+        """Neutralize spreadsheet formula-injection by prefixing risky cells with '."""
+        text = str(value)
+        if text and text[0] in ('=', '+', '-', '@'):
+            return "'" + text
+        return text
+
     def save_results(self, results):
         if not self.folder_path:
             self.log('Choose an output folder to save result files.')
@@ -1017,13 +1047,26 @@ class ConfigScannerApp(ctk.CTk):
             self.log('Saved scan_results.json')
 
             csv_path = os.path.join(output_dir, 'scan_results.csv')
-            with open(csv_path, 'w', encoding='utf-8') as f:
-                f.write('method,proto,link,remark,latency_ms,speed_kbps,success_ratio,average_latency_ms,score,classification\n')
+            with open(csv_path, 'w', encoding='utf-8', newline='') as f:
+                writer = csv.writer(f)
+                writer.writerow([
+                    'method', 'proto', 'link', 'remark', 'latency_ms', 'speed_kbps',
+                    'success_ratio', 'average_latency_ms', 'score', 'classification', 'reason'
+                ])
                 for item in results:
-                    f.write(
-                        f"{item['method']},{item['proto']},\"{item['link']}\",\"{item['remark']}\"," +
-                        f"{item['latency']},{item['speed']:.2f},{item['success_ratio']},{item.get('average_latency','')},{item['score']},{item['classification']}\n"
-                    )
+                    writer.writerow([
+                        self._csv_safe(item['method']),
+                        self._csv_safe(item['proto']),
+                        self._csv_safe(item['link']),
+                        self._csv_safe(item['remark']),
+                        self._csv_safe(item['latency']),
+                        self._csv_safe(f"{item['speed']:.2f}"),
+                        self._csv_safe(item['success_ratio']),
+                        self._csv_safe(item.get('average_latency', '')),
+                        self._csv_safe(item['score']),
+                        self._csv_safe(item['classification']),
+                        self._csv_safe(item.get('reason', '')),
+                    ])
             self.log('Saved scan_results.csv')
 
         groups = {'fast': [], 'medium': [], 'slow': [], 'dead': []}
@@ -1034,13 +1077,18 @@ class ConfigScannerApp(ctk.CTk):
             file_base = f'{classification}_verified.txt' if classification != 'dead' else 'dead.txt'
             file_path = os.path.join(output_dir, file_base)
             with open(file_path, 'w', encoding='utf-8') as f:
-                # Format: link | remark
+                # Format: link | remark   (dead entries also append the failure reason)
                 for item in items:
                     remark = item.get('remark', '')
                     if remark and remark != 'NoRemark':
-                        f.write(f"{item['link']} | {remark}\n")
+                        line = f"{item['link']} | {remark}"
                     else:
-                        f.write(f"{item['link']}\n")
+                        line = f"{item['link']}"
+                    if classification == 'dead':
+                        reason = item.get('reason', '')
+                        if reason:
+                            line = f"{line} | {reason}"
+                    f.write(line + '\n')
             self.log(f'Saved {file_base}')
 
     def export_active_links(self):

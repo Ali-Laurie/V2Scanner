@@ -1,6 +1,3 @@
-import os
-
-
 def _parse_alpn(value):
     if not value:
         return ['h2', 'http/1.1']

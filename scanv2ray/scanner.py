@@ -40,11 +40,23 @@ class Scanner:
         try:
             proc = subprocess.Popen(
                 args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 creationflags=CREATE_NO_WINDOW
             )
             time.sleep(0.2)
+            if proc.poll() is not None:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+                try:
+                    debug_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Core', 'process_launch_error.log'))
+                    with open(debug_path, 'a', encoding='utf-8') as df:
+                        df.write(f"[EARLY_EXIT] rc={proc.returncode} args={args}\n")
+                except Exception:
+                    pass
+                return None
             return proc
         except Exception:
             try:
@@ -160,26 +172,36 @@ class Scanner:
             except Exception:
                 metrics['error_count'] += 1
 
+        # success_ratio reflects the connectivity PROBE requests only, so it
+        # means the same thing on both the early-return and full paths. The
+        # download outcome is tracked separately below.
         connectivity_ratio = metrics['successes'] / metrics['requests'] if metrics['requests'] else 0.0
+        metrics['success_ratio'] = connectivity_ratio
+        metrics['download_requested'] = False
+        metrics['download_success'] = False
         if metrics['successes'] == 0:
-            metrics['success_ratio'] = connectivity_ratio
             metrics['average_latency'] = int(sum(metrics['latencies']) / len(metrics['latencies'])) if metrics['latencies'] else None
             return metrics
 
         download_bytes = 10000 if quick else 50000
         download_url = f'https://speed.cloudflare.com/__down?bytes={download_bytes}'
-        metrics['requests'] += 1
+        metrics['download_requested'] = True
         dl_start = time.time()
         try:
             with self.speed_test_semaphore:
                 dl_req = Request(download_url, headers={'User-Agent': 'Mozilla/5.0'})
                 download_timeout = max(endpoint_timeout, 4.0) if quick else max(timeout, 8.0)
+                total_bytes = 0
                 with opener.open(dl_req, timeout=download_timeout) as response:
-                    data = response.read(download_bytes)
+                    while total_bytes < download_bytes:
+                        chunk = response.read(min(65536, download_bytes - total_bytes))
+                        if not chunk:
+                            break
+                        total_bytes += len(chunk)
             duration = time.time() - dl_start
-            if duration > 0 and len(data) > 0:
-                metrics['download_kbps'] = len(data) / 1024 / duration
-                metrics['successes'] += 1
+            if duration > 0 and total_bytes > 0:
+                metrics['download_kbps'] = total_bytes / 1024 / duration
+                metrics['download_success'] = True
                 if metrics['first_response_ms'] is None:
                     metrics['first_response_ms'] = int(duration * 1000)
             else:
@@ -187,7 +209,6 @@ class Scanner:
         except Exception:
             metrics['error_count'] += 1
 
-        metrics['success_ratio'] = metrics['successes'] / metrics['requests'] if metrics['requests'] else 0.0
         metrics['average_latency'] = int(sum(metrics['latencies']) / len(metrics['latencies'])) if metrics['latencies'] else None
         return metrics
 
@@ -238,35 +259,45 @@ class Scanner:
         if not os.path.exists(binary_path):
             return None
 
-        local_port = get_free_port()
-        config_data = self._build_config(parsed, local_port, engine)
-        if not config_data:
-            return None
-
-        config_path = self._write_config(config_data)
-        if not prevalidated and not self._validate_config(binary_path, config_path, engine):
-            self._cleanup_process(None, config_path)
-            return None
-
-        args = [binary_path, '-c', config_path]
-        proc = self._run_core_process(args)
-        if not proc:
-            self._cleanup_process(proc, config_path)
-            return None
-
         startup_timeout = 2.0 if quick else min(max(timeout, 2.0), 4.0)
-        if not self._wait_for_local_port(local_port, timeout=startup_timeout):
-            self._cleanup_process(proc, config_path)
-            return None
 
-        try:
-            metrics = self._measure_proxy(local_port, timeout, quick=quick)
-            if metrics['success_ratio'] < 0.3 and metrics['download_kbps'] < 1.0:
+        # Retry the launch ONCE with a freshly acquired port if the core fails
+        # to start or the local port never opens (mitigates get_free_port races).
+        for attempt in range(2):
+            local_port = get_free_port()
+            config_data = self._build_config(parsed, local_port, engine)
+            if not config_data:
                 return None
 
-            return self._build_benchmark_result(parsed.get('link', ''), parsed, engine, metrics)
-        finally:
-            self._cleanup_process(proc, config_path)
+            config_path = self._write_config(config_data)
+            if not prevalidated and not self._validate_config(binary_path, config_path, engine):
+                self._cleanup_process(None, config_path)
+                return None
+
+            args = [binary_path, '-c', config_path]
+            proc = self._run_core_process(args)
+            if not proc:
+                self._cleanup_process(proc, config_path)
+                if attempt == 0:
+                    continue
+                return None
+
+            if not self._wait_for_local_port(local_port, timeout=startup_timeout):
+                self._cleanup_process(proc, config_path)
+                if attempt == 0:
+                    continue
+                return None
+
+            try:
+                metrics = self._measure_proxy(local_port, timeout, quick=quick)
+                if metrics['success_ratio'] < 0.3 and metrics['download_kbps'] < 1.0:
+                    return None
+
+                return self._build_benchmark_result(parsed.get('link', ''), parsed, engine, metrics)
+            finally:
+                self._cleanup_process(proc, config_path)
+
+        return None
 
     def precheck_link(self, link, timeout=0.7):
         parsed = parser.parse_link(link)
