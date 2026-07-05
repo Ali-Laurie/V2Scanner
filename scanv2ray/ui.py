@@ -13,6 +13,7 @@ import sys
 
 from .parser import extract_links, resolve_source, parse_link
 from .scanner import Scanner
+from . import engine
 
 
 ctk.set_appearance_mode('dark')
@@ -826,6 +827,9 @@ class ConfigScannerApp(ctk.CTk):
             if not timeout:
                 timeout = 3.0
 
+            # Reset any prior abort flag before starting fresh work
+            self.scanner.reset_abort()
+
             if methods and not os.path.exists(self.scanner.xray_path):
                 self.log('xray.exe not found in Core/xray folder.')
                 self.set_status('Scan aborted: xray.exe missing')
@@ -835,26 +839,23 @@ class ConfigScannerApp(ctk.CTk):
             self.log(f'Processing {total_links} unique configs.')
             selected_method = 'xray' if 'xray' in methods else 'fast'
             precheck_workers = min(max_workers * 4, 200)
-            validation_workers = min(max_workers, 80)
             if ultra:
-                real_workers = min(max_workers, 48)
-                speed_limit = min(real_workers, 24)
+                test_workers = min(max_workers, 100)
+                speed_limit = min(test_workers, 24)
             else:
-                real_workers = min(max_workers, 12)
-                speed_limit = min(real_workers, 6)
+                test_workers = min(max_workers, 16)
+                speed_limit = min(test_workers, 6)
             self.scanner.set_speed_test_limit(speed_limit)
             self.log(
-                f'Pipeline: precheck workers={precheck_workers}, validation workers={validation_workers}, '
-                f'real-test workers={real_workers}, speed-test slots={speed_limit}, '
-                f'mode={selected_method}, ultra={"on" if ultra else "off"}.'
+                f'Pipeline: precheck workers={precheck_workers}, test workers={test_workers}, '
+                f'speed-test slots={speed_limit}, mode={selected_method}, '
+                f'ultra={"on" if ultra else "off"}.'
             )
 
             results = []
-            prechecked_items = []
-            prepared_items = []
-            precheck_done = 0
-            validation_done = 0
-            real_done = 0
+            pre_done = 0
+            reachable = 0
+            test_done = 0
             fast_count = 0
             medium_count = 0
             slow_count = 0
@@ -862,154 +863,78 @@ class ConfigScannerApp(ctk.CTk):
             active_links = set()
             fast_links_set = set()
             normal_links_set = set()
+            last_pct = 0.0
 
-            executor = ThreadPoolExecutor(max_workers=precheck_workers)
-            try:
-                        futures = {executor.submit(self.scanner.precheck_link, link): link for link in unique_links}
-                        pending = set(futures.keys())
-                        while pending:
-                            if self.scan_state in ('stopping', 'stopping_save'):
-                                self.log('Stopping precheck loop.')
-                                break
-                            done, not_done = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                            if not done:
-                                # allow pause to be honored
-                                while self.scan_state == 'paused':
-                                    time.sleep(0.2)
-                                continue
+            def show_progress(pct):
+                # Precheck and test phases overlap while streaming, so keep the
+                # bar monotonic to avoid it bouncing backwards.
+                nonlocal last_pct
+                if pct > last_pct:
+                    last_pct = pct
+                self.set_progress(min(last_pct, 1.0))
 
-                            for future in list(done):
-                                pending.discard(future)
-                                precheck_done += 1
-                                link = futures[future]
-                                try:
-                                    prechecked = future.result()
-                                except Exception as e:
-                                    prechecked = {'ok': False, 'link': link, 'reason': f'precheck_exception: {e}'}
+            def report_dead(link, parsed, reason, stage):
+                nonlocal dead_count
+                dead_count += 1
+                method_label = 'tcp_precheck' if stage == 'precheck' else selected_method
+                orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
+                results.append(self._dead_result(link, reason, method_label, orig_remark))
+                self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
 
-                                if prechecked.get('ok'):
-                                    prechecked_items.append(prechecked)
-                                else:
-                                    dead_count += 1
-                                    # Extract original remark if available
-                                    parsed = prechecked.get('parsed')
-                                    orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
-                                    results.append(self._dead_result(link, prechecked.get('reason', 'tcp_precheck_failed'), 'tcp_precheck', orig_remark))
+            def report_precheck(pd, total, reach):
+                nonlocal pre_done, reachable
+                pre_done = pd
+                reachable = reach
+                pct = (pd / total) * 0.15 if total else 0
+                show_progress(pct)
+                self.set_status(f'Prechecked {pd}/{total} ({reach} reachable)')
 
-                                pct = (precheck_done / total_links) * 0.15 if total_links else 0
-                                self.set_progress(pct)
-                                self.set_status(f'Prechecked {precheck_done}/{total_links} ({len(prechecked_items)} reachable)')
-                                self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
-            finally:
-                executor.shutdown(wait=False, cancel_futures=True)
+            def report_test(item, result, td, reach):
+                nonlocal test_done, reachable, fast_count, medium_count, slow_count, dead_count
+                test_done = td
+                reachable = reach
+                if result:
+                    results.append(result)
+                    link = item.get('link', '') if item else result.get('link', '')
+                    classification = result.get('classification', 'dead')
+                    if classification == 'fast':
+                        fast_count += 1
+                        fast_links_set.add(link)
+                    elif classification == 'medium':
+                        medium_count += 1
+                        normal_links_set.add(link)
+                    elif classification == 'slow':
+                        slow_count += 1
+                        normal_links_set.add(link)
+                    else:
+                        dead_count += 1
+                    active_links.add(link)
+                pct = 0.15 + (td / max(reach, 1)) * 0.85
+                show_progress(pct)
+                self.set_status(f'Tested {td}/{max(reach, 1)} reachable configs')
+                self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
 
-            if self.scan_state not in ('stopping', 'stopping_save'):
-                self.log(f'Precheck complete: {len(prechecked_items)}/{total_links} reachable endpoints.')
+            def should_stop():
+                return self.scan_state in ('stopping', 'stopping_save')
 
-            validation_total = len(prechecked_items)
-            if validation_total and self.scan_state not in ('stopping', 'stopping_save'):
-                executor = ThreadPoolExecutor(max_workers=validation_workers)
-                try:
-                    futures = {executor.submit(self.scanner.validate_prechecked_link, item): item for item in prechecked_items}
-                    pending = set(futures.keys())
-                    while pending:
-                        if self.scan_state in ('stopping', 'stopping_save'):
-                            self.log('Stopping validation loop.')
-                            break
-                        done, not_done = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                        if not done:
-                            while self.scan_state == 'paused':
-                                time.sleep(0.2)
-                            continue
+            def wait_if_paused():
+                while self.scan_state == 'paused':
+                    with self.pause_cond:
+                        if self.scan_state == 'paused':
+                            self.pause_cond.wait(timeout=0.2)
 
-                        for future in list(done):
-                            pending.discard(future)
-                            validation_done += 1
-                            prechecked = futures[future]
-                            link = prechecked['link']
-                            try:
-                                prepared = future.result()
-                            except Exception as e:
-                                prepared = {'ok': False, 'link': link, 'reason': f'validation_exception: {e}'}
-
-                            if prepared.get('ok'):
-                                prepared_items.append(prepared)
-                            else:
-                                dead_count += 1
-                                # Extract original remark from prechecked parsed data
-                                parsed = prechecked.get('parsed')
-                                orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
-                                results.append(self._dead_result(link, prepared.get('reason', 'xray_validation_failed'), 'xray_validation', orig_remark))
-
-                            pct = 0.15 + ((validation_done / validation_total) * 0.25 if validation_total else 0)
-                            self.set_progress(pct)
-                            self.set_status(f'Validated {validation_done}/{validation_total} ({len(prepared_items)} Xray-ready)')
-                            self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
+            engine.run_pipeline(
+                self.scanner, unique_links,
+                method=selected_method, timeout=timeout,
+                precheck_workers=precheck_workers, test_workers=test_workers,
+                should_stop=should_stop, wait_if_paused=wait_if_paused,
+                report_precheck=report_precheck, report_dead=report_dead,
+                report_test=report_test,
+            )
 
             if self.scan_state not in ('stopping', 'stopping_save'):
-                self.log(f'Validation complete: {len(prepared_items)}/{len(prechecked_items)} reachable configs accepted.')
-
-            real_total = len(prepared_items)
-            if real_total and self.scan_state not in ('stopping', 'stopping_save'):
-                executor = ThreadPoolExecutor(max_workers=real_workers)
-                try:
-                    futures = {executor.submit(self.scanner.test_prepared_link, item, timeout, selected_method): item for item in prepared_items}
-                    pending = set(futures.keys())
-                    while pending:
-                        if self.scan_state in ('stopping', 'stopping_save'):
-                            self.log('Stopping real-test loop.')
-                            break
-                        done, not_done = wait(pending, timeout=0.5, return_when=FIRST_COMPLETED)
-                        if not done:
-                            while self.scan_state == 'paused':
-                                time.sleep(0.2)
-                            continue
-
-                        for future in list(done):
-                            pending.discard(future)
-                            real_done += 1
-                            prepared = futures[future]
-                            link = prepared['link']
-                            try:
-                                item = future.result()
-                            except Exception as e:
-                                item = None
-                                # Extract original remark from prepared data
-                                parsed = prepared.get('parsed')
-                                orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
-                                results.append(self._dead_result(link, f'real_test_exception: {e}', selected_method, orig_remark))
-
-                            if item:
-                                results.append(item)
-                                classification = item.get('classification', 'dead')
-                                if classification == 'fast':
-                                    fast_count += 1
-                                    fast_links_set.add(link)
-                                elif classification == 'medium':
-                                    medium_count += 1
-                                    normal_links_set.add(link)
-                                elif classification == 'slow':
-                                    slow_count += 1
-                                    normal_links_set.add(link)
-                                else:
-                                    dead_count += 1
-                                active_links.add(link)
-                            else:
-                                dead_count += 1
-                                if not any(result.get('link') == link and result.get('classification') == 'dead' for result in results):
-                                    # Extract original remark from prepared data
-                                    parsed = prepared.get('parsed')
-                                    orig_remark = parsed.get('remark', 'NoRemark') if parsed else 'NoRemark'
-                                    results.append(self._dead_result(link, 'connectivity_or_speed_failed', selected_method, orig_remark))
-
-                            pct = 0.40 + ((real_done / real_total) * 0.60 if real_total else 0)
-                            self.set_progress(pct)
-                            self.set_status(f'Tested {real_done}/{real_total} ready configs')
-                            self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
-                finally:
-                    executor.shutdown(wait=False, cancel_futures=True)
+                self.log(f'Precheck complete: {reachable}/{total_links} reachable endpoints.')
+                self.log(f'Testing complete: {test_done}/{max(reachable, 1)} reachable configs tested.')
 
             if self.scan_state != 'stopping':
                 self.fast_links = sorted(fast_links_set)

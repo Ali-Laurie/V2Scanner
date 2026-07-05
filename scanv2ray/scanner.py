@@ -24,6 +24,23 @@ class Scanner:
         self.xray_path = xray_path
         self.singbox_path = singbox_path
         self.speed_test_semaphore = threading.BoundedSemaphore(6)
+        self._active_procs = set()
+        self._proc_lock = threading.Lock()
+        self._aborted = False
+
+    def request_abort(self):
+        # mark aborted and kill every currently-running xray process immediately
+        self._aborted = True
+        with self._proc_lock:
+            procs = list(self._active_procs)
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+
+    def reset_abort(self):
+        self._aborted = False
 
     def set_speed_test_limit(self, limit):
         self.speed_test_semaphore = threading.BoundedSemaphore(max(1, int(limit)))
@@ -57,6 +74,8 @@ class Scanner:
                 except Exception:
                     pass
                 return None
+            with self._proc_lock:
+                self._active_procs.add(proc)
             return proc
         except Exception:
             try:
@@ -69,6 +88,9 @@ class Scanner:
             return None
 
     def _cleanup_process(self, proc, config_path):
+        if proc is not None:
+            with self._proc_lock:
+                self._active_procs.discard(proc)
         if proc:
             try:
                 proc.terminate()
@@ -87,6 +109,8 @@ class Scanner:
     def _wait_for_local_port(self, port, timeout=5.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if self._aborted:
+                return False
             try:
                 with socket.create_connection(('127.0.0.1', port), timeout=0.5):
                     return True
@@ -95,18 +119,37 @@ class Scanner:
         return False
 
     def _validate_xray_config(self, binary_path, config_path):
+        # Run `xray -test` via a REGISTERED Popen so request_abort() can kill an
+        # in-flight validation immediately on stop (subprocess.run could not be).
         try:
-            result = subprocess.run([binary_path, '-test', '-c', config_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-            if result.returncode != 0:
+            proc = subprocess.Popen(
+                [binary_path, '-test', '-c', config_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+            )
+        except Exception:
+            return False
+        with self._proc_lock:
+            self._active_procs.add(proc)
+        try:
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.communicate()
+                except Exception:
+                    pass
+                return False
+            if proc.returncode != 0:
                 try:
                     debug_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Core', 'xray_config_test.log'))
                     with open(debug_path, 'a', encoding='utf-8') as df:
                         df.write(f"[XRAY_TEST_FAIL] cmd={[binary_path, '-test', '-c', config_path]}\n")
-                        df.write(result.stdout.decode('utf-8', errors='ignore') + '\n')
-                        df.write(result.stderr.decode('utf-8', errors='ignore') + '\n')
+                        df.write(out.decode('utf-8', errors='ignore') + '\n')
+                        df.write(err.decode('utf-8', errors='ignore') + '\n')
                 except Exception:
                     pass
-            return result.returncode == 0
+            return proc.returncode == 0
         except Exception:
             try:
                 debug_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Core', 'xray_config_test.log'))
@@ -115,6 +158,9 @@ class Scanner:
             except Exception:
                 pass
             return False
+        finally:
+            with self._proc_lock:
+                self._active_procs.discard(proc)
 
     def _validate_singbox_config(self, binary_path, config_path):
         try:
@@ -153,6 +199,8 @@ class Scanner:
         }
 
         for endpoint in endpoints:
+            if self._aborted:
+                break
             req = Request(endpoint, headers={'User-Agent': 'Mozilla/5.0'})
             metrics['requests'] += 1
             start_time = time.time()
@@ -180,6 +228,10 @@ class Scanner:
         metrics['download_requested'] = False
         metrics['download_success'] = False
         if metrics['successes'] == 0:
+            metrics['average_latency'] = int(sum(metrics['latencies']) / len(metrics['latencies'])) if metrics['latencies'] else None
+            return metrics
+
+        if self._aborted:
             metrics['average_latency'] = int(sum(metrics['latencies']) / len(metrics['latencies'])) if metrics['latencies'] else None
             return metrics
 
@@ -270,6 +322,9 @@ class Scanner:
                 return None
 
             config_path = self._write_config(config_data)
+            if self._aborted:
+                self._cleanup_process(None, config_path)
+                return None
             if not prevalidated and not self._validate_config(binary_path, config_path, engine):
                 self._cleanup_process(None, config_path)
                 return None
@@ -383,6 +438,18 @@ class Scanner:
         result = self._test_core(parsed, timeout, self.xray_path, 'xray', quick=quick, prevalidated=True)
         if result:
             result['method'] = method
+        return result
+
+    def validate_and_test(self, item, timeout, method):
+        parsed = item.get('parsed')
+        link = item.get('link', '')
+        if self._aborted or not parsed or not os.path.exists(self.xray_path):
+            return None
+        quick = (method != 'xray')   # 'fast' -> quick=True ; 'xray' -> quick=False
+        # _test_core with prevalidated=False performs xray -test validation, then launches & measures.
+        result = self._test_core(parsed, timeout, self.xray_path, 'xray', quick=quick, prevalidated=False)
+        if result:
+            result['method'] = method   # preserve the run's method label ('fast'/'xray')
         return result
 
     def process_link(self, link, timeout, methods):
