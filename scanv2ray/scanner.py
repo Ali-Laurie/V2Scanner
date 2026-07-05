@@ -2,6 +2,7 @@ import json
 import os
 import socket
 import subprocess
+import sys
 import threading
 import time
 import uuid
@@ -9,6 +10,10 @@ from urllib.request import ProxyHandler, build_opener, Request
 
 from . import configs
 from . import parser
+
+# Suppress the console window every xray child would otherwise flash on Windows.
+# 0 on non-Windows so Popen stays valid there (also unblocks headless/server use).
+CREATE_NO_WINDOW = 0x08000000 if sys.platform == 'win32' else 0
 
 
 def get_free_port():
@@ -53,7 +58,6 @@ class Scanner:
         return config_path
 
     def _run_core_process(self, args):
-        CREATE_NO_WINDOW = 0x08000000
         try:
             proc = subprocess.Popen(
                 args,
@@ -124,7 +128,8 @@ class Scanner:
         try:
             proc = subprocess.Popen(
                 [binary_path, '-test', '-c', config_path],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW
             )
         except Exception:
             return False
