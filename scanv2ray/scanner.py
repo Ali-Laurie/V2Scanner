@@ -348,16 +348,20 @@ class Scanner:
         if metrics['success_ratio'] < 0.3 and metrics['download_kbps'] < 1.0:
             return 0.0, 'dead'
 
-        speed_score = min(metrics['download_kbps'] / 200.0 * 100.0, 100.0)
-        delay = metrics.get('first_response_ms') or 1000
-        delay_score = max(0.0, min(1.0, (1000.0 - delay) / 1000.0)) * 100.0
+        # Normalisation is deliberately forgiving so real-world proxies land in
+        # fast/medium rather than all collapsing into slow: full speed points at
+        # 150 kbps, latency credited up to 1500 ms, and a success floor of 20.
+        speed_score = min(metrics['download_kbps'] / 150.0 * 100.0, 100.0)
+        delay = metrics.get('first_response_ms') or 1200
+        delay_score = max(0.0, min(1.0, (1500.0 - delay) / 1500.0)) * 100.0
         stability_score = metrics['success_ratio'] * 100.0
-        success_score = 100.0 if metrics['success_ratio'] >= 0.9 else 50.0 if metrics['success_ratio'] >= 0.75 else 0.0
+        sr = metrics['success_ratio']
+        success_score = 100.0 if sr >= 0.85 else 60.0 if sr >= 0.6 else 20.0
 
-        score = speed_score * 0.4 + delay_score * 0.3 + stability_score * 0.2 + success_score * 0.1
-        if score >= 75.0:
+        score = speed_score * 0.35 + delay_score * 0.30 + stability_score * 0.25 + success_score * 0.10
+        if score >= 60.0:
             classification = 'fast'
-        elif score >= 55.0:
+        elif score >= 40.0:
             classification = 'medium'
         else:
             classification = 'slow'

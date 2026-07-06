@@ -15,29 +15,56 @@ from . import naming
 
 
 # ---------------------------------------------------------------------------
-# Design system (Spotify-like dark theme)
+# Design system — "NEON RECON" (dark cyber control-panel)
 # ---------------------------------------------------------------------------
-BG = '#121212'
-CARD = '#181818'
-CARD2 = '#1e1e1e'
-HOVER = '#282828'
-HOVER_LIGHT = '#333333'
-ACCENT = '#1DB954'
-ACCENT_HOVER = '#1ed760'
-TEXT = '#FFFFFF'
-MUTED = '#B3B3B3'
-DANGER = '#E22134'
-DANGER_HOVER = '#b71a29'
-WARN = '#F0A500'
-WARN_HOVER = '#c98700'
-SLOW = '#9f7aea'
-BORDER = '#2a2a2a'
-RADIUS = 12
-PILL = 20
+BG = '#070A12'            # near-black, blue bias
+PANEL = '#0E1524'
+PANEL2 = '#111C30'
+RAISE = '#16233b'
+LINE = '#1b2b45'          # subtle panel borders
+
+CYAN = '#2CE5F6'          # primary accent
+CYAN_DIM = '#0e5561'      # dim cyan for glows / borders
+CYAN_HOVER = '#7ff2ff'
+
+MAGENTA = '#FF3D8B'
+AMBER = '#FFB020'
+ACID = '#C8FF00'
+RED = '#FF4D4D'
+
+TEXT = '#EAF2FF'
+MUTED = '#7C89A6'
+
+# hover companions for filled controls
+AMBER_HOVER = '#c98700'
+RED_HOVER = '#c93b3b'
+
+# semantic result colors
+FAST_COLOR = CYAN
+MEDIUM_COLOR = AMBER
+SLOW_COLOR = MAGENTA
+DEAD_COLOR = RED
+
+# hero gradient endpoints
+HERO_TOP = BG
+HERO_BOTTOM = '#0b1836'
+
+RADIUS = 14
+PILL = 22
 
 
 ctk.set_appearance_mode('dark')
 ctk.set_default_color_theme('blue')
+
+
+def _lerp_color(c1, c2, t):
+    """Linear interpolate two '#rrggbb' colors, return '#rrggbb'."""
+    r1, g1, b1 = int(c1[1:3], 16), int(c1[3:5], 16), int(c1[5:7], 16)
+    r2, g2, b2 = int(c2[1:3], 16), int(c2[3:5], 16), int(c2[5:7], 16)
+    r = int(r1 + (r2 - r1) * t)
+    g = int(g1 + (g2 - g1) * t)
+    b = int(b1 + (b2 - b1) * t)
+    return f'#{r:02x}{g:02x}{b:02x}'
 
 
 class ConfigScannerApp(ctk.CTk):
@@ -101,6 +128,20 @@ class ConfigScannerApp(ctk.CTk):
     def _font(self, size=13, weight='normal'):
         return ctk.CTkFont(size=size, weight=weight)
 
+    def _mono(self, size=12, weight='normal'):
+        return ctk.CTkFont(family='Courier New', size=size, weight=weight)
+
+    @staticmethod
+    def _spaced(text):
+        """Letter-spaced uppercase label for section headers."""
+        return ' '.join(text.upper())
+
+    def _accent_stripe(self, card, color):
+        """Thin colored top-stripe that makes a card read like a control module."""
+        stripe = ctk.CTkFrame(card, fg_color=color, width=1, height=3, corner_radius=0)
+        stripe.place(relx=0.0, y=0, relwidth=1.0)
+        return stripe
+
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
@@ -122,49 +163,68 @@ class ConfigScannerApp(ctk.CTk):
         self._build_progress_card()
         self._build_results_card()
 
-        self.log_frame = ctk.CTkFrame(self.scroll, fg_color=CARD, corner_radius=RADIUS)
+        self.log_frame = ctk.CTkFrame(self.scroll, fg_color=PANEL, corner_radius=RADIUS,
+                                      border_color=LINE, border_width=1)
         self.log_frame.grid(row=1, column=0, padx=24, pady=(4, 18), sticky='ew')
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(1, weight=1)
+        self._accent_stripe(self.log_frame, ACID)
 
-        self.log_label = ctk.CTkLabel(self.log_frame, text='Activity log',
-                                      font=self._font(15, 'bold'), text_color=TEXT)
-        self.log_label.grid(row=0, column=0, padx=18, pady=(14, 4), sticky='w')
+        self.log_label = ctk.CTkLabel(self.log_frame, text=self._spaced('Activity Log'),
+                                      font=self._mono(12, 'bold'), text_color=CYAN)
+        self.log_label.grid(row=0, column=0, padx=18, pady=(16, 4), sticky='w')
 
         self.box = ctk.CTkTextbox(self.log_frame, height=170, wrap='word',
-                                  fg_color=CARD2, text_color=MUTED,
-                                  border_color=BORDER, border_width=1, corner_radius=8)
+                                  fg_color=PANEL2, text_color=CYAN,
+                                  border_color=LINE, border_width=1, corner_radius=8,
+                                  font=self._mono(12))
         self.box.grid(row=1, column=0, padx=18, pady=(0, 18), sticky='nsew')
 
+    # ---- Hero banner (Canvas) ----------------------------------------
     def _build_header(self):
-        self.header_frame = ctk.CTkFrame(self, fg_color='transparent')
-        self.header_frame.grid(row=0, column=0, padx=24, pady=(20, 8), sticky='ew')
-        self.header_frame.grid_columnconfigure(1, weight=1)
+        self.hero = ctk.CTkCanvas(self, height=120, highlightthickness=0, bd=0, bg=BG)
+        self.hero.grid(row=0, column=0, sticky='ew')
+        self.hero.bind('<Configure>', self._draw_hero)
 
-        self.logo_dot = ctk.CTkFrame(self.header_frame, width=16, height=16,
-                                     fg_color=ACCENT, corner_radius=8)
-        self.logo_dot.grid(row=0, column=0, sticky='w', padx=(0, 12), pady=(4, 0))
-        self.logo_dot.grid_propagate(False)
+    def _draw_hero(self, event=None):
+        c = self.hero
+        c.delete('all')
+        w = event.width if event is not None else c.winfo_width()
+        if w <= 1:
+            w = self.winfo_width() or 900
+        h = 120
 
-        self.header = ctk.CTkLabel(self.header_frame, text='ScanV2Ray',
-                                   font=self._font(30, 'bold'), text_color=TEXT)
-        self.header.grid(row=0, column=1, sticky='w')
+        # Vertical gradient BG -> deep indigo
+        for i in range(h):
+            t = i / (h - 1)
+            c.create_line(0, i, w, i, fill=_lerp_color(HERO_TOP, HERO_BOTTOM, t))
 
-        self.subtitle = ctk.CTkLabel(
-            self.header_frame,
-            text='Import proxy configs, scan them with Xray, and export the working results.',
-            text_color=MUTED, font=self._font(13))
-        self.subtitle.grid(row=1, column=1, sticky='w', pady=(2, 0))
+        # Faint recon dot-grid
+        for x in range(0, w, 34):
+            for y in range(16, h - 8, 24):
+                c.create_line(x, y, x + 1, y, fill='#13294a')
+
+        # Thin cyan scanline strokes
+        c.create_line(0, 30, w, 30, fill=CYAN_DIM)
+        c.create_line(0, 100, w, 100, fill='#122a3e')
+
+        # Wordmark + mono tagline
+        c.create_text(28, 50, text='ScanV2Ray', anchor='w',
+                      fill=TEXT, font=('Segoe UI', 38, 'bold'))
+        c.create_text(30, 88, text='PROXY RECON · XRAY + SING-BOX', anchor='w',
+                      fill=CYAN, font=('Courier New', 12, 'bold'))
 
     # ---- Sources card -------------------------------------------------
     def _build_sources_card(self):
-        self.source_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
+        self.source_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+                                         border_color=LINE, border_width=1)
         self.source_frame.grid(row=0, column=0, padx=(0, 8), pady=(0, 12), sticky='nsew')
         self.source_frame.grid_columnconfigure(0, weight=1)
+        self._accent_stripe(self.source_frame, CYAN)
 
-        self.source_title = ctk.CTkLabel(self.source_frame, text='Sources',
-                                         font=self._font(15, 'bold'), text_color=TEXT)
-        self.source_title.grid(row=0, column=0, padx=18, pady=(16, 2), sticky='w')
+        self.source_title = ctk.CTkLabel(self.source_frame, text=self._spaced('Sources'),
+                                         font=self._mono(12, 'bold'), text_color=CYAN)
+        self.source_title.grid(row=0, column=0, padx=18, pady=(18, 2), sticky='w')
 
         self.source_hint = ctk.CTkLabel(
             self.source_frame,
@@ -173,16 +233,17 @@ class ConfigScannerApp(ctk.CTk):
         self.source_hint.grid(row=1, column=0, padx=18, pady=(0, 10), sticky='w')
 
         self.source_textbox = ctk.CTkTextbox(self.source_frame, height=100, wrap='word',
-                                             fg_color=CARD2, text_color=TEXT,
-                                             border_color=BORDER, border_width=1, corner_radius=8)
+                                             fg_color=PANEL2, text_color=TEXT,
+                                             border_color=LINE, border_width=1, corner_radius=8,
+                                             font=self._mono(12))
         self.source_textbox.grid(row=2, column=0, padx=18, pady=(0, 8), sticky='ew')
 
         # Visible list of loaded sources (so user can see and remove selections)
         self.sources_listbox = Listbox(
             self.source_frame, height=6, selectmode='extended',
-            background=CARD2, foreground=TEXT, borderwidth=0, highlightthickness=1,
-            highlightbackground=BORDER, selectbackground=ACCENT, selectforeground='#000000',
-            activestyle='none', font=('TkDefaultFont', 9))
+            background=PANEL2, foreground=CYAN, borderwidth=0, highlightthickness=1,
+            highlightbackground=LINE, selectbackground=CYAN, selectforeground=BG,
+            activestyle='none', font=('Courier New', 9))
         self.sources_listbox.grid(row=3, column=0, padx=18, pady=(0, 10), sticky='ew')
 
         self.source_actions = ctk.CTkFrame(self.source_frame, fg_color='transparent')
@@ -207,7 +268,8 @@ class ConfigScannerApp(ctk.CTk):
         self.protocol_vars = {p: StringVar(value='1') for p in self.protocols}
         self.protocol_count_labels = {}
 
-        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color=CARD2, corner_radius=8)
+        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color=PANEL2, corner_radius=8,
+                                            border_color=LINE, border_width=1)
         self.protocols_frame.grid(row=5, column=0, padx=18, pady=(6, 6), sticky='ew')
         ncols = 5
         for c in range(ncols):
@@ -219,27 +281,29 @@ class ConfigScannerApp(ctk.CTk):
             chk = ctk.CTkCheckBox(
                 self.protocols_frame, text=proto.upper(), variable=self.protocol_vars[proto],
                 onvalue='1', offvalue='0', command=self.update_link_count,
-                font=self._font(11), text_color=TEXT, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                checkmark_color='#000000', border_color=MUTED, checkbox_width=18, checkbox_height=18)
+                font=self._mono(11), text_color=TEXT, fg_color=CYAN, hover_color=CYAN_HOVER,
+                checkmark_color=BG, border_color=LINE, checkbox_width=18, checkbox_height=18)
             chk.grid(row=row, column=col, sticky='w', padx=8, pady=(8, 0))
-            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color=MUTED, font=self._font(11))
+            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color=MUTED, font=self._mono(11))
             lbl.grid(row=row + 1, column=col, sticky='w', padx=8, pady=(0, 6))
             self.protocol_count_labels[proto] = lbl
 
         self.link_count_label = ctk.CTkLabel(
             self.source_frame, text='0 configs loaded',
-            font=self._font(13, 'bold'), text_color=ACCENT)
+            font=self._mono(14, 'bold'), text_color=CYAN)
         self.link_count_label.grid(row=6, column=0, padx=18, pady=(4, 16), sticky='w')
 
     # ---- Setup card ---------------------------------------------------
     def _build_setup_card(self):
-        self.setup_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
+        self.setup_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+                                        border_color=LINE, border_width=1)
         self.setup_frame.grid(row=0, column=1, padx=(8, 0), pady=(0, 12), sticky='nsew')
         self.setup_frame.grid_columnconfigure(0, weight=1)
+        self._accent_stripe(self.setup_frame, MAGENTA)
 
-        self.setup_title = ctk.CTkLabel(self.setup_frame, text='Scan setup',
-                                        font=self._font(15, 'bold'), text_color=TEXT)
-        self.setup_title.grid(row=0, column=0, padx=18, pady=(16, 2), sticky='w')
+        self.setup_title = ctk.CTkLabel(self.setup_frame, text=self._spaced('Scan Setup'),
+                                        font=self._mono(12, 'bold'), text_color=CYAN)
+        self.setup_title.grid(row=0, column=0, padx=18, pady=(18, 2), sticky='w')
 
         self.mode_label = ctk.CTkLabel(self.setup_frame, text='Scan mode',
                                        text_color=MUTED, font=self._font(12))
@@ -248,16 +312,16 @@ class ConfigScannerApp(ctk.CTk):
         self.mode_selector = ctk.CTkSegmentedButton(
             self.setup_frame, values=['Quick', 'Full'], variable=self.scan_mode_var,
             command=lambda _value: self.update_link_count(),
-            selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
-            unselected_color=CARD2, unselected_hover_color=HOVER,
-            text_color=TEXT, fg_color=CARD2, font=self._font(13, 'bold'))
+            selected_color=CYAN, selected_hover_color=CYAN_HOVER,
+            unselected_color=PANEL2, unselected_hover_color=RAISE,
+            text_color=TEXT, fg_color=PANEL2, font=self._mono(13, 'bold'))
         self.mode_selector.grid(row=2, column=0, padx=18, pady=(0, 12), sticky='ew')
         self.mode_selector.set('Quick')
 
         self.ultra_switch = ctk.CTkSwitch(
             self.setup_frame, text='⚡ Ultra Scan',
             variable=self.ultra_scan_var, onvalue=True, offvalue=False,
-            progress_color=ACCENT, button_color=TEXT, button_hover_color=MUTED,
+            progress_color=CYAN, button_color=TEXT, button_hover_color=MUTED,
             text_color=TEXT, font=self._font(12))
         self.ultra_switch.grid(row=3, column=0, padx=18, pady=(0, 14), sticky='w')
 
@@ -265,14 +329,14 @@ class ConfigScannerApp(ctk.CTk):
         self.select_button.grid(row=4, column=0, padx=18, pady=(0, 8), sticky='ew')
 
         self.folder_label = ctk.CTkLabel(
-            self.setup_frame, text='No output folder selected',
-            text_color=MUTED, font=self._font(12), wraplength=360, justify='left')
+            self.setup_frame, text='No folder chosen',
+            text_color=MUTED, font=self._mono(11), wraplength=220, justify='left')
         self.folder_label.grid(row=5, column=0, padx=18, pady=(0, 12), sticky='w')
 
         self.start_button = ctk.CTkButton(
             self.setup_frame, text='Start scan', command=self.start_scan, state='disabled',
-            height=44, corner_radius=PILL, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            text_color='#000000', font=self._font(15, 'bold'))
+            height=46, corner_radius=PILL, fg_color=CYAN, hover_color=CYAN_HOVER,
+            text_color=BG, font=self._font(15, 'bold'))
         self.start_button.grid(row=6, column=0, padx=18, pady=(0, 10), sticky='ew')
 
         self.advanced_button = self._secondary_btn(
@@ -282,12 +346,14 @@ class ConfigScannerApp(ctk.CTk):
         self._build_advanced_frame()
 
     def _build_advanced_frame(self):
-        self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=CARD2, corner_radius=8)
+        self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=PANEL2, corner_radius=8,
+                                           border_color=LINE, border_width=1)
         self.advanced_frame.grid_columnconfigure((0, 1), weight=1)
 
         def num_entry(default):
-            e = ctk.CTkEntry(self.advanced_frame, fg_color=CARD, text_color=TEXT,
-                             border_color=BORDER, border_width=1, corner_radius=8)
+            e = ctk.CTkEntry(self.advanced_frame, fg_color=PANEL, text_color=CYAN,
+                             border_color=LINE, border_width=1, corner_radius=8,
+                             font=self._mono(13, 'bold'))
             e.insert(0, default)
             return e
 
@@ -299,22 +365,23 @@ class ConfigScannerApp(ctk.CTk):
         field_label('Test workers').grid(row=0, column=1, padx=10, pady=(12, 4), sticky='w')
         self.precheck_entry = num_entry('200')
         self.precheck_entry.grid(row=1, column=0, padx=10, pady=(0, 8), sticky='ew')
-        self.test_entry = num_entry('16')
+        self.test_entry = num_entry('32')
         self.test_entry.grid(row=1, column=1, padx=10, pady=(0, 8), sticky='ew')
 
         # Row 2/3: speed-test slots | timeout
         field_label('Speed-test slots').grid(row=2, column=0, padx=10, pady=(6, 4), sticky='w')
         field_label('Timeout (ms)').grid(row=2, column=1, padx=10, pady=(6, 4), sticky='w')
-        self.speed_entry = num_entry('6')
+        self.speed_entry = num_entry('24')
         self.speed_entry.grid(row=3, column=0, padx=10, pady=(0, 8), sticky='ew')
-        self.timeout_entry = num_entry('3000')
+        self.timeout_entry = num_entry('3500')
         self.timeout_entry.grid(row=3, column=1, padx=10, pady=(0, 8), sticky='ew')
 
         # Remark override
         field_label('Remark (optional)').grid(row=4, column=0, padx=10, pady=(6, 4), sticky='w')
         self.remarker_entry = ctk.CTkEntry(
-            self.advanced_frame, textvariable=self.remarker_var, fg_color=CARD,
-            text_color=TEXT, border_color=BORDER, border_width=1, corner_radius=8)
+            self.advanced_frame, textvariable=self.remarker_var, fg_color=PANEL,
+            text_color=TEXT, border_color=LINE, border_width=1, corner_radius=8,
+            font=self._mono(12))
         self.remarker_entry.grid(row=5, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
 
         # Feature toggles
@@ -329,8 +396,9 @@ class ConfigScannerApp(ctk.CTk):
 
         self.site_config_btn = ctk.CTkButton(
             self.advanced_frame, text='Sites…', command=self.open_site_config,
-            width=80, height=28, corner_radius=PILL, fg_color=HOVER,
-            hover_color=HOVER_LIGHT, text_color=TEXT, font=self._font(12))
+            width=80, height=28, corner_radius=PILL, fg_color='transparent',
+            border_width=1, border_color=CYAN_DIM, hover_color=RAISE,
+            text_color=TEXT, font=self._font(12))
         self.site_config_btn.grid(row=7, column=1, padx=10, pady=(4, 10), sticky='w')
 
         self.dedupe_switch = self._switch(self.advanced_frame, 'Remove duplicates', self.dedupe_var)
@@ -338,16 +406,18 @@ class ConfigScannerApp(ctk.CTk):
 
     # ---- Progress card ------------------------------------------------
     def _build_progress_card(self):
-        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
+        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+                                           border_color=LINE, border_width=1)
         self.progress_frame.grid(row=1, column=0, columnspan=2, pady=(0, 12), sticky='ew')
         self.progress_frame.grid_columnconfigure(0, weight=1)
+        self._accent_stripe(self.progress_frame, AMBER)
 
         self.status = ctk.CTkLabel(self.progress_frame, text='Ready',
-                                   font=self._font(13, 'bold'), text_color=TEXT)
-        self.status.grid(row=0, column=0, padx=18, pady=(14, 6), sticky='w')
+                                   font=self._mono(13, 'bold'), text_color=TEXT)
+        self.status.grid(row=0, column=0, padx=18, pady=(16, 6), sticky='w')
 
         self.progress_bar = ctk.CTkProgressBar(
-            self.progress_frame, progress_color=ACCENT, fg_color=CARD2, height=8, corner_radius=4)
+            self.progress_frame, progress_color=CYAN, fg_color=PANEL2, height=8, corner_radius=4)
         self.progress_bar.set(0)
         self.progress_bar.grid(row=1, column=0, padx=18, pady=(0, 14), sticky='ew')
 
@@ -357,42 +427,45 @@ class ConfigScannerApp(ctk.CTk):
 
         self.pause_button = ctk.CTkButton(
             self.controls_frame, text='Pause', command=self.toggle_pause, state='disabled',
-            corner_radius=PILL, height=38, fg_color=WARN, hover_color=WARN_HOVER,
-            text_color='#000000', font=self._font(13, 'bold'))
+            corner_radius=PILL, height=38, fg_color=AMBER, hover_color=AMBER_HOVER,
+            text_color=BG, font=self._font(13, 'bold'))
         self.pause_button.grid(row=0, column=0, padx=5, sticky='ew')
 
         self.stop_save_button = ctk.CTkButton(
             self.controls_frame, text='Stop and save', command=self.stop_and_save, state='disabled',
-            corner_radius=PILL, height=38, fg_color=HOVER, hover_color=HOVER_LIGHT,
-            text_color=TEXT, font=self._font(13, 'bold'))
+            corner_radius=PILL, height=38, fg_color='transparent', border_width=1,
+            border_color=LINE, hover_color=RAISE, text_color=TEXT, font=self._font(13, 'bold'))
         self.stop_save_button.grid(row=0, column=1, padx=5, sticky='ew')
 
         self.stop_button = ctk.CTkButton(
             self.controls_frame, text='Stop', command=self.stop_scan_now, state='disabled',
-            corner_radius=PILL, height=38, fg_color=DANGER, hover_color=DANGER_HOVER,
-            text_color=TEXT, font=self._font(13, 'bold'))
+            corner_radius=PILL, height=38, fg_color='transparent', border_width=1,
+            border_color=RED, hover_color=RAISE, text_color=RED, font=self._font(13, 'bold'))
         self.stop_button.grid(row=0, column=2, padx=5, sticky='ew')
 
     # ---- Results card -------------------------------------------------
     def _build_results_card(self):
-        self.results_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
+        self.results_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+                                          border_color=LINE, border_width=1)
         self.results_frame.grid(row=2, column=0, columnspan=2, sticky='ew')
         self.results_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        self._accent_stripe(self.results_frame, CYAN)
 
         stat_specs = [
-            ('fast_label', 'Fast', ACCENT),
-            ('medium_label', 'Medium', WARN),
-            ('slow_label', 'Slow', SLOW),
-            ('dead_label', 'Dead', DANGER),
+            ('fast_label', 'Fast', FAST_COLOR),
+            ('medium_label', 'Medium', MEDIUM_COLOR),
+            ('slow_label', 'Slow', SLOW_COLOR),
+            ('dead_label', 'Dead', DEAD_COLOR),
         ]
         for column, (attr, label, color) in enumerate(stat_specs):
-            tile = ctk.CTkFrame(self.results_frame, fg_color=CARD2, corner_radius=10)
+            tile = ctk.CTkFrame(self.results_frame, fg_color=PANEL2, corner_radius=10,
+                                border_color=color, border_width=1)
             tile.grid(row=0, column=column, padx=(14 if column == 0 else 6, 6 if column < 3 else 14),
-                      pady=(16, 10), sticky='ew')
+                      pady=(18, 10), sticky='ew')
             tile.grid_columnconfigure(0, weight=1)
-            num = ctk.CTkLabel(tile, text='0', text_color=color, font=self._font(24, 'bold'))
+            num = ctk.CTkLabel(tile, text='0', text_color=color, font=self._mono(26, 'bold'))
             num.grid(row=0, column=0, padx=10, pady=(10, 0))
-            cap = ctk.CTkLabel(tile, text=label, text_color=MUTED, font=self._font(12))
+            cap = ctk.CTkLabel(tile, text=self._spaced(label), text_color=MUTED, font=self._mono(10))
             cap.grid(row=1, column=0, padx=10, pady=(0, 10))
             setattr(self, attr, num)
 
@@ -407,29 +480,32 @@ class ConfigScannerApp(ctk.CTk):
 
         self.copy_all_btn = ctk.CTkButton(
             self.results_frame, text='Copy All', command=self.copy_all, state='disabled',
-            corner_radius=PILL, height=38, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            text_color='#000000', font=self._font(13, 'bold'))
+            corner_radius=PILL, height=38, fg_color=CYAN, hover_color=CYAN_HOVER,
+            text_color=BG, font=self._font(13, 'bold'))
         self.copy_all_btn.grid(row=1, column=3, padx=(5, 14), pady=(0, 16), sticky='ew')
 
     # ---- Styled-widget helpers ---------------------------------------
     def _secondary_btn(self, parent, text, command):
         return ctk.CTkButton(parent, text=text, command=command, corner_radius=PILL,
-                             height=36, fg_color=HOVER, hover_color=HOVER_LIGHT,
+                             height=36, fg_color='transparent', border_width=1,
+                             border_color=CYAN_DIM, hover_color=RAISE,
                              text_color=TEXT, font=self._font(13, 'bold'))
 
     def _danger_btn(self, parent, text, command):
         return ctk.CTkButton(parent, text=text, command=command, corner_radius=PILL,
-                             height=36, fg_color=DANGER, hover_color=DANGER_HOVER,
-                             text_color=TEXT, font=self._font(13, 'bold'))
+                             height=36, fg_color='transparent', border_width=1,
+                             border_color=RED, hover_color=RAISE,
+                             text_color=RED, font=self._font(13, 'bold'))
 
     def _copy_btn(self, text, command):
         return ctk.CTkButton(self.results_frame, text=text, command=command, state='disabled',
-                             corner_radius=PILL, height=38, fg_color=HOVER, hover_color=HOVER_LIGHT,
+                             corner_radius=PILL, height=38, fg_color='transparent', border_width=1,
+                             border_color=CYAN_DIM, hover_color=RAISE,
                              text_color=TEXT, font=self._font(13, 'bold'))
 
     def _switch(self, parent, text, variable):
         return ctk.CTkSwitch(parent, text=text, variable=variable, onvalue=True, offvalue=False,
-                             progress_color=ACCENT, button_color=TEXT, button_hover_color=MUTED,
+                             progress_color=CYAN, button_color=TEXT, button_hover_color=MUTED,
                              text_color=TEXT, font=self._font(12))
 
     # ------------------------------------------------------------------
@@ -446,6 +522,16 @@ class ConfigScannerApp(ctk.CTk):
         popup.configure(fg_color=BG)
         self.site_popup = popup
 
+        # Force the popup to the front and make it modal so it never hides
+        # behind the main window (notably on Windows where CTkToplevel drops back).
+        popup.transient(self)
+        popup.update_idletasks()
+        popup.lift()
+        popup.focus_force()
+        popup.attributes('-topmost', True)
+        popup.after(300, lambda: popup.winfo_exists() and popup.attributes('-topmost', False))
+        popup.grab_set()
+
         header = ctk.CTkLabel(popup, text='Sites to verify',
                               font=self._font(16, 'bold'), text_color=TEXT)
         header.pack(padx=18, pady=(16, 2), anchor='w')
@@ -453,7 +539,7 @@ class ConfigScannerApp(ctk.CTk):
                      text_color=MUTED, font=self._font(12), wraplength=380,
                      justify='left').pack(padx=18, pady=(0, 8), anchor='w')
 
-        self.site_list_frame = ctk.CTkScrollableFrame(popup, fg_color=CARD, corner_radius=RADIUS,
+        self.site_list_frame = ctk.CTkScrollableFrame(popup, fg_color=PANEL, corner_radius=RADIUS,
                                                       height=220)
         self.site_list_frame.pack(padx=18, pady=(0, 10), fill='both', expand=True)
         self._populate_site_list()
@@ -462,23 +548,23 @@ class ConfigScannerApp(ctk.CTk):
         add_frame.pack(padx=18, pady=(0, 8), fill='x')
         add_frame.grid_columnconfigure(0, weight=1)
         self.site_add_entry = ctk.CTkEntry(add_frame, placeholder_text='https://example.com',
-                                           fg_color=CARD2, text_color=TEXT, border_color=BORDER,
-                                           border_width=1, corner_radius=8)
+                                           fg_color=PANEL2, text_color=TEXT, border_color=LINE,
+                                           border_width=1, corner_radius=8, font=self._mono(12))
         self.site_add_entry.grid(row=0, column=0, padx=(0, 6), sticky='ew')
         add_btn = ctk.CTkButton(add_frame, text='Add', width=70, command=self._add_custom_site,
-                                corner_radius=PILL, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-                                text_color='#000000', font=self._font(12, 'bold'))
+                                corner_radius=PILL, fg_color=CYAN, hover_color=CYAN_HOVER,
+                                text_color=BG, font=self._font(12, 'bold'))
         add_btn.grid(row=0, column=1)
 
         strict = ctk.CTkCheckBox(popup, text='Strict (must reach all selected sites)',
                                  variable=self.site_strict_var, onvalue=True, offvalue=False,
-                                 fg_color=ACCENT, hover_color=ACCENT_HOVER, checkmark_color='#000000',
-                                 border_color=MUTED, text_color=TEXT, font=self._font(12))
+                                 fg_color=CYAN, hover_color=CYAN_HOVER, checkmark_color=BG,
+                                 border_color=LINE, text_color=TEXT, font=self._font(12))
         strict.pack(padx=18, pady=(4, 10), anchor='w')
 
         done_btn = ctk.CTkButton(popup, text='Done', command=popup.destroy,
-                                 corner_radius=PILL, height=40, fg_color=ACCENT,
-                                 hover_color=ACCENT_HOVER, text_color='#000000',
+                                 corner_radius=PILL, height=40, fg_color=CYAN,
+                                 hover_color=CYAN_HOVER, text_color=BG,
                                  font=self._font(14, 'bold'))
         done_btn.pack(padx=18, pady=(0, 16), fill='x')
 
@@ -489,12 +575,12 @@ class ConfigScannerApp(ctk.CTk):
             row = ctk.CTkFrame(self.site_list_frame, fg_color='transparent')
             row.pack(fill='x', pady=3)
             chk = ctk.CTkCheckBox(row, text=name, variable=self.site_vars[name],
-                                  onvalue=True, offvalue=False, fg_color=ACCENT,
-                                  hover_color=ACCENT_HOVER, checkmark_color='#000000',
-                                  border_color=MUTED, text_color=TEXT, font=self._font(13))
+                                  onvalue=True, offvalue=False, fg_color=CYAN,
+                                  hover_color=CYAN_HOVER, checkmark_color=BG,
+                                  border_color=LINE, text_color=TEXT, font=self._font(13))
             chk.pack(side='left', anchor='w')
             ctk.CTkLabel(row, text=self.site_urls[name], text_color=MUTED,
-                         font=self._font(11)).pack(side='left', padx=(10, 0))
+                         font=self._mono(11)).pack(side='left', padx=(10, 0))
 
     def _add_custom_site(self):
         url = self.site_add_entry.get().strip()
@@ -764,12 +850,12 @@ class ConfigScannerApp(ctk.CTk):
     def toggle_pause(self):
         if self.scan_state == 'running':
             self.scan_state = 'paused'
-            self.pause_button.configure(text='Resume', fg_color=ACCENT, hover_color=ACCENT_HOVER)
+            self.pause_button.configure(text='Resume', fg_color=CYAN, hover_color=CYAN_HOVER)
             self.log('Scan paused.')
             self.set_status('Scan paused')
         elif self.scan_state == 'paused':
             self.scan_state = 'running'
-            self.pause_button.configure(text='Pause', fg_color=WARN, hover_color=WARN_HOVER)
+            self.pause_button.configure(text='Pause', fg_color=AMBER, hover_color=AMBER_HOVER)
             self.log('Scan resumed.')
             self.set_status('Scan resumed')
             with self.pause_cond:
@@ -855,7 +941,7 @@ class ConfigScannerApp(ctk.CTk):
         self.active = []
         self.update_live_stats(0, 0, 0, 0)
         self.scan_state = 'running'
-        self.pause_button.configure(text='Pause', fg_color=WARN, hover_color=WARN_HOVER)
+        self.pause_button.configure(text='Pause', fg_color=AMBER, hover_color=AMBER_HOVER)
         self.set_control_buttons('normal', 'normal', 'normal')
 
         # Read GUI inputs on the MAIN thread (Tk access is not thread-safe).
@@ -872,16 +958,16 @@ class ConfigScannerApp(ctk.CTk):
             if test_workers <= 0:
                 raise ValueError
         except Exception:
-            test_workers = 16
-            self.log('Invalid test workers. Using 16.')
+            test_workers = 32
+            self.log('Invalid test workers. Using 32.')
 
         try:
             speed_limit = int(self.speed_entry.get().strip())
             if speed_limit <= 0:
                 raise ValueError
         except Exception:
-            speed_limit = 6
-            self.log('Invalid speed-test slots. Using 6.')
+            speed_limit = 24
+            self.log('Invalid speed-test slots. Using 24.')
 
         try:
             timeout_ms = float(self.timeout_entry.get().strip())
@@ -889,8 +975,8 @@ class ConfigScannerApp(ctk.CTk):
                 raise ValueError
             timeout = timeout_ms / 1000.0
         except Exception:
-            timeout = 3.0
-            self.log('Invalid timeout. Using 3000ms.')
+            timeout = 3.5
+            self.log('Invalid timeout. Using 3500ms.')
 
         try:
             remark_override = self.remarker_var.get().strip()
