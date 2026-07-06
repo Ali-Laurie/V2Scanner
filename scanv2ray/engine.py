@@ -39,7 +39,7 @@ def dedupe_links(links, parse_link):
 def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_workers,
                  should_stop, wait_if_paused,
                  report_precheck, report_dead, report_test,
-                 retry_failed=False):
+                 retry_failed=False, should_stop_precheck=None, on_prechecks_done=None):
     """
     Streaming precheck -> (validate+realtest) pipeline with a bounded rolling test pool.
     Peak concurrent xray == test_workers (each test worker holds at most one long-running
@@ -72,6 +72,7 @@ def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_work
     pending_test = {}   # future -> item
     retried = set()     # id(item) of items already resubmitted once (feature C)
     stopped = False
+    prechecks_done_signaled = False
 
     def _finish_test(fut):
         nonlocal test_done
@@ -128,6 +129,21 @@ def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_work
                 for f in pending_pre:
                     f.cancel()
                 break
+
+            # "Stop & go to phase 2": drop the remaining un-prechecked links but
+            # keep testing everything already found reachable, then finalize.
+            if pending_pre and should_stop_precheck is not None and should_stop_precheck():
+                for f in pending_pre:
+                    f.cancel()
+                pending_pre = set()
+                pre_link.clear()
+
+            # Signal once that phase 1 (precheck) is over so the UI can swap
+            # the button to "Stop & save" for phase 2.
+            if not pending_pre and not prechecks_done_signaled:
+                prechecks_done_signaled = True
+                if on_prechecks_done is not None:
+                    on_prechecks_done()
 
             if pending_pre:
                 # Block briefly on prechecks while draining tests non-blocking.

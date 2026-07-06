@@ -105,16 +105,20 @@ class ConfigScannerApp(ctk.CTk):
         self.log_filepath = None
         self.advanced_visible = False
 
-        # Live-chart state (donut + progress sparkline)
+        # Live donut chart state
         self.donut_canvas = None
-        self.spark_canvas = None
         self._donut_counts = (0, 0, 0, 0)
-        self._progress_samples = []
-        self._scan_t0 = None
-        # Coalesce chart redraws so live updates / resize storms never flood
-        # the Tk main loop (was causing UI + system lag).
         self._donut_pending = False
-        self._spark_pending = False
+        # Coalesced UI state: the worker thread only writes these; a single
+        # ~8 fps refresh loop on the main thread applies the latest values, so
+        # a 50k-config scan can't flood Tk with per-config after() callbacks
+        # (that was freezing the UI and lagging scroll).
+        self._pending_status = None
+        self._pending_progress = None
+        self._pending_counts = None
+        self._pending_phase = None
+        self._scan_phase = 'idle'        # 'precheck' | 'test' | 'idle'
+        self._skip_precheck = False      # "Stop & go to phase 2" flag
 
         if getattr(sys, 'frozen', False):
             base_dir = sys._MEIPASS
@@ -147,6 +151,8 @@ class ConfigScannerApp(ctk.CTk):
         self.site_popup = None
 
         self._build_ui()
+        # Single coalesced UI refresh loop (decouples UI rate from scan rate).
+        self.after(120, self._ui_refresh)
 
     # ------------------------------------------------------------------
     # UI construction
@@ -325,8 +331,9 @@ class ConfigScannerApp(ctk.CTk):
                 font=self._mono(11), text_color=TEXT, fg_color=ACCENT, hover_color=ACCENT_HOVER,
                 checkmark_color=WHITE, border_color=LINE, checkbox_width=18, checkbox_height=18)
             chk.grid(row=row, column=col, sticky='w', padx=8, pady=(8, 0))
-            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color=MUTED, font=self._mono(11))
-            lbl.grid(row=row + 1, column=col, sticky='w', padx=8, pady=(0, 6))
+            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color=TEXT,
+                               font=self._mono(18, 'bold'))
+            lbl.grid(row=row + 1, column=col, sticky='w', padx=8, pady=(0, 8))
             self.protocol_count_labels[proto] = lbl
 
         self.link_count_label = ctk.CTkLabel(
@@ -379,9 +386,36 @@ class ConfigScannerApp(ctk.CTk):
             text_color=WHITE, text_color_disabled='#C8CED8', font=self._font(15, 'bold'))
         self.start_button.grid(row=6, column=0, padx=20, pady=(0, 10), sticky='ew')
 
+        # Speed preset — fills the numeric fields below (still editable by hand).
+        self.preset_var = StringVar(value='Medium')
+        ctk.CTkLabel(self.setup_frame, text='Speed preset', text_color=MUTED,
+                     font=self._font(12)).grid(row=7, column=0, padx=20, pady=(2, 2), sticky='w')
+        self.preset_selector = ctk.CTkSegmentedButton(
+            self.setup_frame, values=['Slow', 'Medium', 'Fast'], variable=self.preset_var,
+            command=self._apply_preset, fg_color=SURFACE2, selected_color=ACCENT,
+            selected_hover_color=ACCENT_HOVER, unselected_color=SURFACE2,
+            unselected_hover_color=ELEV, text_color=TEXT, font=self._font(12, 'bold'))
+        self.preset_selector.grid(row=8, column=0, padx=20, pady=(0, 10), sticky='ew')
+        self.preset_selector.set('Medium')
+
         # Advanced settings are always visible (no show/hide toggle).
         self._build_advanced_frame()
-        self.advanced_frame.grid(row=7, column=0, padx=20, pady=(0, 14), sticky='ew')
+        self.advanced_frame.grid(row=9, column=0, padx=20, pady=(0, 14), sticky='ew')
+
+    PRESETS = {
+        'Slow':   {'precheck': '80',  'test': '12', 'speed': '6',  'timeout': '5000'},
+        'Medium': {'precheck': '200', 'test': '32', 'speed': '24', 'timeout': '3500'},
+        'Fast':   {'precheck': '400', 'test': '64', 'speed': '40', 'timeout': '2500'},
+    }
+
+    def _apply_preset(self, value):
+        preset = self.PRESETS.get(value)
+        if not preset:
+            return
+        for entry, key in ((self.precheck_entry, 'precheck'), (self.test_entry, 'test'),
+                           (self.speed_entry, 'speed'), (self.timeout_entry, 'timeout')):
+            entry.delete(0, END)
+            entry.insert(0, preset[key])
 
     def _build_advanced_frame(self):
         self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=SURFACE2, corner_radius=INNER_R,
@@ -464,14 +498,8 @@ class ConfigScannerApp(ctk.CTk):
         self.progress_bar.set(0)
         self.progress_bar.grid(row=2, column=0, padx=20, pady=(0, 12), sticky='ew')
 
-        # Live progress sparkline (cumulative tested over time)
-        self.spark_canvas = ctk.CTkCanvas(self.progress_frame, height=64,
-                                          highlightthickness=0, bd=0, bg=SURFACE)
-        self.spark_canvas.grid(row=3, column=0, padx=20, pady=(0, 14), sticky='ew')
-        self.spark_canvas.bind('<Configure>', self._draw_sparkline)
-
         self.controls_frame = ctk.CTkFrame(self.progress_frame, fg_color='transparent')
-        self.controls_frame.grid(row=4, column=0, padx=15, pady=(0, 16), sticky='ew')
+        self.controls_frame.grid(row=3, column=0, padx=15, pady=(6, 16), sticky='ew')
         self.controls_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.pause_button = ctk.CTkButton(
@@ -481,7 +509,7 @@ class ConfigScannerApp(ctk.CTk):
         self.pause_button.grid(row=0, column=0, padx=5, sticky='ew')
 
         self.stop_save_button = ctk.CTkButton(
-            self.controls_frame, text='Stop and save', command=self.stop_and_save, state='disabled',
+            self.controls_frame, text='Stop and save', command=self._stop_save_action, state='disabled',
             corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
             border_color=LINE, hover_color=ELEV, text_color=TEXT,
             text_color_disabled='#C8CED8', font=self._font(13, 'bold'))
@@ -493,8 +521,6 @@ class ConfigScannerApp(ctk.CTk):
             border_color=DEAD_DIM, hover_color=ELEV, text_color=DEAD,
             text_color_disabled='#C8CED8', font=self._font(13, 'bold'))
         self.stop_button.grid(row=0, column=2, padx=5, sticky='ew')
-
-        self._draw_sparkline()
 
     # ---- Results card (mini dashboard: donut + tiles + copy) ----------
     def _build_results_card(self):
@@ -603,7 +629,7 @@ class ConfigScannerApp(ctk.CTk):
         return widget
 
     # ------------------------------------------------------------------
-    # Live graphics — donut chart + progress sparkline
+    # Live graphics — donut chart
     # ------------------------------------------------------------------
     def _draw_donut(self, event=None):
         # Throttle: coalesce bursts of redraws (live stats + <Configure>) to
@@ -684,60 +710,6 @@ class ConfigScannerApp(ctk.CTk):
                           font=('Segoe UI', 11))
             c.create_text(w - 20, y, text=str(val), anchor='e', fill=col,
                           font=('Courier New', 12, 'bold'))
-
-    def _draw_sparkline(self, event=None):
-        if self._spark_pending:
-            return
-        self._spark_pending = True
-        self.after(150, self._render_sparkline)
-
-    def _render_sparkline(self):
-        self._spark_pending = False
-        c = getattr(self, 'spark_canvas', None)
-        if c is None:
-            return
-        try:
-            if not c.winfo_exists():
-                return
-        except Exception:
-            return
-        c.delete('all')
-        w = c.winfo_width()
-        h = c.winfo_height()
-        if w <= 1:
-            w = 600
-        if h <= 1:
-            h = 64
-        pad = 6
-
-        # Trough background
-        c.create_rectangle(0, 0, w, h, fill=SURFACE2, outline='')
-
-        samples = list(self._progress_samples)
-        if len(samples) < 2:
-            baseline = h - pad
-            c.create_line(pad, baseline, w - pad, baseline, fill=LINE, width=2)
-            return
-
-        maxt = max((t for t, _ in samples), default=0) or 1.0
-        maxv = max((v for _, v in samples), default=0) or 1.0
-
-        def X(t):
-            return pad + (t / maxt) * (w - 2 * pad)
-
-        def Y(v):
-            return (h - pad) - (v / maxv) * (h - 2 * pad)
-
-        pts = [(X(t), Y(v)) for t, v in samples]
-
-        # Soft translucent-looking fill down to the baseline
-        fill_pts = [(pts[0][0], h - pad)] + pts + [(pts[-1][0], h - pad)]
-        flat_fill = [coord for p in fill_pts for coord in p]
-        c.create_polygon(*flat_fill, fill=ACCENT_DIM, outline='')
-
-        # Accent line on top
-        flat = [coord for p in pts for coord in p]
-        c.create_line(*flat, fill=ACCENT, width=2, smooth=True)
 
     # ------------------------------------------------------------------
     # Site-check configuration popup
@@ -842,41 +814,77 @@ class ConfigScannerApp(ctk.CTk):
     # Thread-safe logging / UI marshaling
     # ------------------------------------------------------------------
     def log(self, text):
+        # Worker threads only enqueue; the refresh loop flushes (bounded).
         with self.log_lock:
             self.log_queue.append(text)
-            if not self.log_scheduled:
-                self.log_scheduled = True
-                self.after(10, self._process_log_queue)
 
-    def _process_log_queue(self):
+    def _ui_refresh(self):
+        # Runs on the main thread ~8x/sec; applies only the latest pending
+        # values so a fast scan can never flood the event loop.
+        try:
+            if not self.winfo_exists():
+                return
+        except Exception:
+            return
+        try:
+            if self._pending_status is not None:
+                s = self._pending_status
+                self._pending_status = None
+                self.status.configure(text=s)
+                self._update_chip(s)
+            if self._pending_progress is not None:
+                p = self._pending_progress
+                self._pending_progress = None
+                self.progress_bar.set(p)
+            if self._pending_counts is not None:
+                f, m, s, d = self._pending_counts
+                self._pending_counts = None
+                self.fast_label.configure(text=str(f))
+                self.medium_label.configure(text=str(m))
+                self.slow_label.configure(text=str(s))
+                self.dead_label.configure(text=str(d))
+                self._donut_counts = (f, m, s, d)
+                self._draw_donut()
+            if self._pending_phase is not None:
+                ph = self._pending_phase
+                self._pending_phase = None
+                self._scan_phase = ph
+                if ph == 'precheck':
+                    self.stop_save_button.configure(text='Stop → Phase 2')
+                else:
+                    self.stop_save_button.configure(text='Stop and save')
+            self._flush_log()
+        except Exception:
+            pass
+        self.after(120, self._ui_refresh)
+
+    def _flush_log(self):
         with self.log_lock:
-            lines = list(self.log_queue)
-            self.log_queue.clear()
-            self.log_scheduled = False
-
-        for line in lines:
-            self.box.insert('end', line + '\n')
+            lines = self.log_queue
+            self.log_queue = []
+        if not lines:
+            return
+        self.box.insert('end', '\n'.join(lines) + '\n')
+        # Cap the textbox so a huge scan doesn't bloat it (kept ~500 lines).
+        try:
+            total = int(self.box.index('end-1c').split('.')[0])
+            if total > 500:
+                self.box.delete('1.0', f'{total - 500}.0')
+        except Exception:
+            pass
         self.box.see('end')
-
-        # Persist log lines to scan_log.txt (thread-safe via log_lock)
-        if self.log_filepath and lines:
+        if self.log_filepath:
             try:
-                with self.log_lock:
-                    with open(self.log_filepath, 'a', encoding='utf-8') as f:
-                        for line in lines:
-                            f.write(line + '\n')
+                with open(self.log_filepath, 'a', encoding='utf-8') as fp:
+                    fp.write('\n'.join(lines) + '\n')
             except Exception:
                 pass
 
     def set_status(self, text):
-        self.after(0, lambda: self._apply_status(text))
-
-    def _apply_status(self, text):
-        self.status.configure(text=text)
-        self._update_chip(text)
+        self._pending_status = text
 
     def set_progress(self, value):
-        self.after(0, lambda: self.progress_bar.set(value))
+        self._pending_progress = value
 
     def set_control_buttons(self, pause, stop_save, stop):
         self.after(0, lambda: self._set_control_buttons(pause, stop_save, stop))
@@ -897,27 +905,7 @@ class ConfigScannerApp(ctk.CTk):
         ])
 
     def update_live_stats(self, fast, medium, slow, dead):
-        self.after(0, lambda: self._update_live_stats(fast, medium, slow, dead))
-
-    def _update_live_stats(self, fast, medium, slow, dead):
-        self.fast_label.configure(text=str(fast))
-        self.medium_label.configure(text=str(medium))
-        self.slow_label.configure(text=str(slow))
-        self.dead_label.configure(text=str(dead))
-
-        # Feed the live donut
-        self._donut_counts = (fast, medium, slow, dead)
-        self._draw_donut()
-
-        # Feed the live progress sparkline (cumulative tested over time)
-        total = fast + medium + slow + dead
-        if self._scan_t0 is None:
-            self._scan_t0 = time.time()
-        elapsed = time.time() - self._scan_t0
-        self._progress_samples.append((elapsed, total))
-        if len(self._progress_samples) > 240:
-            self._progress_samples = self._progress_samples[-240:]
-        self._draw_sparkline()
+        self._pending_counts = (fast, medium, slow, dead)
 
     def update_link_count(self):
         # Update total loaded count
@@ -1115,6 +1103,21 @@ class ConfigScannerApp(ctk.CTk):
         with self.pause_cond:
             self.pause_cond.notify_all()
 
+    def set_phase(self, phase):
+        # Called from the worker thread; the refresh loop swaps the button label.
+        self._pending_phase = phase
+
+    def _stop_save_action(self):
+        # Dual-purpose middle button. In phase 1 (precheck) it skips the rest of
+        # the prechecks and jumps to phase 2 without discarding anything; in
+        # phase 2 (real test) it stops and saves what has completed.
+        if self._scan_phase == 'precheck':
+            self._skip_precheck = True
+            self.log('Skipping remaining prechecks — going straight to phase 2.')
+            self.set_status('Skipping precheck → phase 2')
+        else:
+            self.stop_and_save()
+
     def check_pause_and_stop(self):
         if self.scan_state in ('stopping', 'stopping_save'):
             return False
@@ -1292,12 +1295,10 @@ class ConfigScannerApp(ctk.CTk):
                  timeout, remark_override, ultra, detect_country, retry_failed, site_check,
                  dedupe, site_targets, site_strict):
         try:
-            # Reset live-chart sample tracking for this fresh scan
-            self._scan_t0 = time.time()
-            self._progress_samples = []
-
             # Reset any prior abort flag before starting fresh work
             self.scanner.reset_abort()
+            self._skip_precheck = False
+            self.set_phase('precheck')
 
             # Configure scanner-driven features for this run
             self.scanner.detect_country = detect_country
@@ -1395,6 +1396,13 @@ class ConfigScannerApp(ctk.CTk):
                         if self.scan_state == 'paused':
                             self.pause_cond.wait(timeout=0.2)
 
+            def should_stop_precheck():
+                return self._skip_precheck
+
+            def on_prechecks_done():
+                # Phase 1 finished (or was skipped) -> phase 2 begins.
+                self.set_phase('test')
+
             engine.run_pipeline(
                 self.scanner, unique_links,
                 method=selected_method, timeout=timeout,
@@ -1402,6 +1410,8 @@ class ConfigScannerApp(ctk.CTk):
                 should_stop=should_stop, wait_if_paused=wait_if_paused,
                 report_precheck=report_precheck, report_dead=report_dead,
                 report_test=report_test, retry_failed=retry_failed,
+                should_stop_precheck=should_stop_precheck,
+                on_prechecks_done=on_prechecks_done,
             )
 
             if self.scan_state not in ('stopping', 'stopping_save'):
@@ -1437,6 +1447,8 @@ class ConfigScannerApp(ctk.CTk):
             self.set_copy_buttons('normal' if has_links else 'disabled')
             self.set_control_buttons('disabled', 'disabled', 'disabled')
             self.scan_state = 'idle'
+            self._skip_precheck = False
+            self.set_phase('idle')
 
     @staticmethod
     def _csv_safe(value):

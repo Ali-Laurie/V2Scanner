@@ -7,6 +7,7 @@ import threading
 import time
 import uuid
 from urllib.request import ProxyHandler, build_opener, Request
+from urllib.error import HTTPError
 
 from . import configs
 from . import parser
@@ -287,17 +288,23 @@ class Scanner:
         # Feature B: site reachability probes, only for connectable configs.
         if (self.site_check and self.site_targets and metrics['successes'] > 0
                 and not self._aborted):
-            site_timeout = min(timeout, 3.0)
+            site_timeout = max(min(timeout, 4.0), 3.0)
             for name, url in self.site_targets:
                 if self._aborted:
                     break
                 try:
                     site_req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
-                    with opener.open(site_req, timeout=site_timeout) as site_resp:
-                        site_status = site_resp.getcode()
-                        if site_status is None or site_status < 400:
-                            metrics['sites_ok'].append(name)
+                    with opener.open(site_req, timeout=site_timeout):
+                        # Any 2xx/3xx response = the proxy reached the site.
+                        metrics['sites_ok'].append(name)
+                except HTTPError:
+                    # 4xx/5xx (e.g. Cloudflare 403 on ChatGPT) STILL means the
+                    # proxy tunneled to the site and got an HTTP reply, so count
+                    # it reachable — otherwise strict mode wrongly rejects
+                    # everything just because a site bot-blocks the request.
+                    metrics['sites_ok'].append(name)
                 except Exception:
+                    # Connection refused / DNS / timeout = genuinely unreachable.
                     pass
 
         # success_ratio reflects the connectivity PROBE requests only, so it
