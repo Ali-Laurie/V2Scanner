@@ -15,42 +15,57 @@ from . import naming
 
 
 # ---------------------------------------------------------------------------
-# Design system — "NEON RECON" (dark cyber control-panel)
+# Design system — modern analytics dashboard (calm, restrained, no neon)
 # ---------------------------------------------------------------------------
-BG = '#070A12'            # near-black, blue bias
-PANEL = '#0E1524'
-PANEL2 = '#111C30'
-RAISE = '#16233b'
-LINE = '#1b2b45'          # subtle panel borders
+BG = '#0F1216'
+SURFACE = '#171B22'
+SURFACE2 = '#1E232C'
+ELEV = '#232935'
+LINE = '#2A313D'
 
-CYAN = '#2CE5F6'          # primary accent
-CYAN_DIM = '#0e5561'      # dim cyan for glows / borders
-CYAN_HOVER = '#7ff2ff'
+ACCENT = '#6D8BFF'         # one soft-indigo accent, used sparingly
+ACCENT_HOVER = '#8098FF'
+ACCENT_DIM = '#39406b'
 
-MAGENTA = '#FF3D8B'
-AMBER = '#FFB020'
-ACID = '#C8FF00'
-RED = '#FF4D4D'
+TEXT = '#E6E9EF'
+MUTED = '#8A93A2'
+FAINT = '#5B6472'
 
-TEXT = '#EAF2FF'
-MUTED = '#7C89A6'
+# semantic result colors (muted; only used in charts / tiles)
+FAST = '#46C48A'
+MEDIUM = '#E6B34E'
+SLOW = '#E08A4C'
+DEAD = '#E06A6A'
 
-# hover companions for filled controls
-AMBER_HOVER = '#c98700'
-RED_HOVER = '#c93b3b'
+WHITE = '#FFFFFF'
+DEAD_DIM = '#5A3A42'       # soft, muted DEAD border for danger buttons
 
-# semantic result colors
-FAST_COLOR = CYAN
-MEDIUM_COLOR = AMBER
-SLOW_COLOR = MAGENTA
-DEAD_COLOR = RED
+# radii
+CARD_R = 16
+INNER_R = 10
+BTN_R = 10
 
-# hero gradient endpoints
+# --- back-compat aliases so untouched widget code keeps working ------------
+PANEL = SURFACE
+PANEL2 = SURFACE2
+RAISE = ELEV
+CYAN = ACCENT
+CYAN_DIM = ACCENT_DIM
+CYAN_HOVER = ACCENT_HOVER
+MAGENTA = SLOW
+AMBER = MEDIUM
+AMBER_HOVER = '#c99a3e'
+ACID = ACCENT
+RED = DEAD
+RED_HOVER = '#c95a5a'
+FAST_COLOR = FAST
+MEDIUM_COLOR = MEDIUM
+SLOW_COLOR = SLOW
+DEAD_COLOR = DEAD
 HERO_TOP = BG
-HERO_BOTTOM = '#0b1836'
-
-RADIUS = 14
-PILL = 22
+HERO_BOTTOM = SURFACE
+RADIUS = CARD_R
+PILL = 20
 
 
 ctk.set_appearance_mode('dark')
@@ -89,6 +104,13 @@ class ConfigScannerApp(ctk.CTk):
         self.log_scheduled = False
         self.log_filepath = None
         self.advanced_visible = False
+
+        # Live-chart state (donut + progress sparkline)
+        self.donut_canvas = None
+        self.spark_canvas = None
+        self._donut_counts = (0, 0, 0, 0)
+        self._progress_samples = []
+        self._scan_t0 = None
 
         if getattr(sys, 'frozen', False):
             base_dir = sys._MEIPASS
@@ -154,7 +176,7 @@ class ConfigScannerApp(ctk.CTk):
         self.scroll.grid_columnconfigure(0, weight=1)
 
         self.main_frame = ctk.CTkFrame(self.scroll, fg_color='transparent')
-        self.main_frame.grid(row=0, column=0, padx=24, pady=8, sticky='ew')
+        self.main_frame.grid(row=0, column=0, padx=24, pady=(16, 8), sticky='ew')
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=1)
 
@@ -163,91 +185,106 @@ class ConfigScannerApp(ctk.CTk):
         self._build_progress_card()
         self._build_results_card()
 
-        self.log_frame = ctk.CTkFrame(self.scroll, fg_color=PANEL, corner_radius=RADIUS,
+        self.log_frame = ctk.CTkFrame(self.scroll, fg_color=SURFACE, corner_radius=CARD_R,
                                       border_color=LINE, border_width=1)
-        self.log_frame.grid(row=1, column=0, padx=24, pady=(4, 18), sticky='ew')
+        self.log_frame.grid(row=1, column=0, padx=24, pady=(4, 20), sticky='ew')
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(1, weight=1)
-        self._accent_stripe(self.log_frame, ACID)
 
-        self.log_label = ctk.CTkLabel(self.log_frame, text=self._spaced('Activity Log'),
-                                      font=self._mono(12, 'bold'), text_color=CYAN)
-        self.log_label.grid(row=0, column=0, padx=18, pady=(16, 4), sticky='w')
+        self.log_label = ctk.CTkLabel(self.log_frame, text='Activity log',
+                                      font=self._font(15, 'bold'), text_color=TEXT)
+        self.log_label.grid(row=0, column=0, padx=20, pady=(18, 4), sticky='w')
 
-        self.box = ctk.CTkTextbox(self.log_frame, height=170, wrap='word',
-                                  fg_color=PANEL2, text_color=CYAN,
-                                  border_color=LINE, border_width=1, corner_radius=8,
+        self.box = ctk.CTkTextbox(self.log_frame, height=180, wrap='word',
+                                  fg_color=SURFACE2, text_color=TEXT,
+                                  border_color=LINE, border_width=1, corner_radius=INNER_R,
                                   font=self._mono(12))
-        self.box.grid(row=1, column=0, padx=18, pady=(0, 18), sticky='nsew')
+        self.box.grid(row=1, column=0, padx=20, pady=(0, 20), sticky='nsew')
 
-    # ---- Hero banner (Canvas) ----------------------------------------
+    # ---- Header (clean top bar) --------------------------------------
     def _build_header(self):
-        self.hero = ctk.CTkCanvas(self, height=120, highlightthickness=0, bd=0, bg=BG)
-        self.hero.grid(row=0, column=0, sticky='ew')
-        self.hero.bind('<Configure>', self._draw_hero)
+        bar = ctk.CTkFrame(self, fg_color=SURFACE, corner_radius=0,
+                           border_width=0, height=84)
+        bar.grid(row=0, column=0, sticky='ew')
+        bar.grid_columnconfigure(0, weight=1)
+        bar.grid_propagate(False)
 
-    def _draw_hero(self, event=None):
-        c = self.hero
-        c.delete('all')
-        w = event.width if event is not None else c.winfo_width()
-        if w <= 1:
-            w = self.winfo_width() or 900
-        h = 120
+        left = ctk.CTkFrame(bar, fg_color='transparent')
+        left.grid(row=0, column=0, padx=24, pady=16, sticky='w')
+        ctk.CTkLabel(left, text='ScanV2Ray', font=self._font(26, 'bold'),
+                     text_color=TEXT).grid(row=0, column=0, sticky='w')
+        ctk.CTkLabel(left, text='Proxy reachability & speed scanner · Xray + sing-box',
+                     font=self._font(12), text_color=MUTED).grid(row=1, column=0, sticky='w')
 
-        # Vertical gradient BG -> deep indigo
-        for i in range(h):
-            t = i / (h - 1)
-            c.create_line(0, i, w, i, fill=_lerp_color(HERO_TOP, HERO_BOTTOM, t))
+        chip = ctk.CTkFrame(bar, fg_color=SURFACE2, corner_radius=20,
+                            border_width=1, border_color=LINE)
+        chip.grid(row=0, column=1, padx=24, pady=16, sticky='e')
+        self.status_dot = ctk.CTkLabel(chip, text='●', text_color=MUTED,
+                                       font=self._font(13))
+        self.status_dot.grid(row=0, column=0, padx=(14, 5), pady=6)
+        self.status_chip = ctk.CTkLabel(chip, text='Idle', text_color=TEXT,
+                                        font=self._font(12, 'bold'))
+        self.status_chip.grid(row=0, column=1, padx=(0, 16), pady=6)
 
-        # Faint recon dot-grid
-        for x in range(0, w, 34):
-            for y in range(16, h - 8, 24):
-                c.create_line(x, y, x + 1, y, fill='#13294a')
+        # thin separator line under the bar
+        sep = ctk.CTkFrame(self, fg_color=LINE, height=1, corner_radius=0)
+        sep.grid(row=0, column=0, sticky='ews')
 
-        # Thin cyan scanline strokes
-        c.create_line(0, 30, w, 30, fill=CYAN_DIM)
-        c.create_line(0, 100, w, 100, fill='#122a3e')
-
-        # Wordmark + mono tagline
-        c.create_text(28, 50, text='ScanV2Ray', anchor='w',
-                      fill=TEXT, font=('Segoe UI', 38, 'bold'))
-        c.create_text(30, 88, text='PROXY RECON · XRAY + SING-BOX', anchor='w',
-                      fill=CYAN, font=('Courier New', 12, 'bold'))
+    def _update_chip(self, text):
+        low = (text or '').lower()
+        if 'paused' in low:
+            dot, label = MEDIUM, 'Paused'
+        elif 'complete' in low or 'completed' in low or 'done' in low:
+            dot, label = FAST, 'Done'
+        elif 'fail' in low or 'abort' in low:
+            dot, label = DEAD, 'Stopped'
+        elif 'stopping' in low or 'saving' in low:
+            dot, label = SLOW, 'Stopping…'
+        elif any(k in low for k in ('scan', 'test', 'precheck', 'process',
+                                    'pipeline', 'starting', 'dedupe')):
+            dot, label = ACCENT, 'Scanning…'
+        else:
+            dot, label = MUTED, 'Idle'
+        try:
+            self.status_dot.configure(text_color=dot)
+            self.status_chip.configure(text=label)
+        except Exception:
+            pass
 
     # ---- Sources card -------------------------------------------------
     def _build_sources_card(self):
-        self.source_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+        self.source_frame = ctk.CTkFrame(self.main_frame, fg_color=SURFACE, corner_radius=CARD_R,
                                          border_color=LINE, border_width=1)
         self.source_frame.grid(row=0, column=0, padx=(0, 8), pady=(0, 12), sticky='nsew')
         self.source_frame.grid_columnconfigure(0, weight=1)
-        self._accent_stripe(self.source_frame, CYAN)
 
-        self.source_title = ctk.CTkLabel(self.source_frame, text=self._spaced('Sources'),
-                                         font=self._mono(12, 'bold'), text_color=CYAN)
-        self.source_title.grid(row=0, column=0, padx=18, pady=(18, 2), sticky='w')
+        self.source_title = ctk.CTkLabel(self.source_frame, text='Sources',
+                                         font=self._font(15, 'bold'), text_color=TEXT)
+        self.source_title.grid(row=0, column=0, padx=20, pady=(18, 2), sticky='w')
 
         self.source_hint = ctk.CTkLabel(
             self.source_frame,
             text='Paste links, subscription URLs, base64 text, JSON, or local file paths.',
             text_color=MUTED, font=self._font(12), wraplength=360, justify='left')
-        self.source_hint.grid(row=1, column=0, padx=18, pady=(0, 10), sticky='w')
+        self.source_hint.grid(row=1, column=0, padx=20, pady=(0, 10), sticky='w')
 
         self.source_textbox = ctk.CTkTextbox(self.source_frame, height=100, wrap='word',
-                                             fg_color=PANEL2, text_color=TEXT,
-                                             border_color=LINE, border_width=1, corner_radius=8,
+                                             fg_color=SURFACE2, text_color=TEXT,
+                                             border_color=LINE, border_width=1, corner_radius=INNER_R,
                                              font=self._mono(12))
-        self.source_textbox.grid(row=2, column=0, padx=18, pady=(0, 8), sticky='ew')
+        self.source_textbox.grid(row=2, column=0, padx=20, pady=(0, 8), sticky='ew')
+        self._focusable(self.source_textbox)
 
         # Visible list of loaded sources (so user can see and remove selections)
         self.sources_listbox = Listbox(
             self.source_frame, height=6, selectmode='extended',
-            background=PANEL2, foreground=CYAN, borderwidth=0, highlightthickness=1,
-            highlightbackground=LINE, selectbackground=CYAN, selectforeground=BG,
+            background=SURFACE2, foreground=TEXT, borderwidth=0, highlightthickness=1,
+            highlightbackground=LINE, selectbackground=ACCENT, selectforeground=WHITE,
             activestyle='none', font=('Courier New', 9))
-        self.sources_listbox.grid(row=3, column=0, padx=18, pady=(0, 10), sticky='ew')
+        self.sources_listbox.grid(row=3, column=0, padx=20, pady=(0, 10), sticky='ew')
 
         self.source_actions = ctk.CTkFrame(self.source_frame, fg_color='transparent')
-        self.source_actions.grid(row=4, column=0, padx=13, pady=(0, 10), sticky='ew')
+        self.source_actions.grid(row=4, column=0, padx=15, pady=(0, 10), sticky='ew')
         self.source_actions.grid_columnconfigure((0, 1), weight=1)
 
         self.add_links_btn = self._secondary_btn(self.source_actions, 'Add pasted', self.add_manual_sources)
@@ -268,9 +305,9 @@ class ConfigScannerApp(ctk.CTk):
         self.protocol_vars = {p: StringVar(value='1') for p in self.protocols}
         self.protocol_count_labels = {}
 
-        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color=PANEL2, corner_radius=8,
+        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color=SURFACE2, corner_radius=INNER_R,
                                             border_color=LINE, border_width=1)
-        self.protocols_frame.grid(row=5, column=0, padx=18, pady=(6, 6), sticky='ew')
+        self.protocols_frame.grid(row=5, column=0, padx=20, pady=(6, 6), sticky='ew')
         ncols = 5
         for c in range(ncols):
             self.protocols_frame.grid_columnconfigure(c, weight=1)
@@ -281,8 +318,8 @@ class ConfigScannerApp(ctk.CTk):
             chk = ctk.CTkCheckBox(
                 self.protocols_frame, text=proto.upper(), variable=self.protocol_vars[proto],
                 onvalue='1', offvalue='0', command=self.update_link_count,
-                font=self._mono(11), text_color=TEXT, fg_color=CYAN, hover_color=CYAN_HOVER,
-                checkmark_color=BG, border_color=LINE, checkbox_width=18, checkbox_height=18)
+                font=self._mono(11), text_color=TEXT, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                checkmark_color=WHITE, border_color=LINE, checkbox_width=18, checkbox_height=18)
             chk.grid(row=row, column=col, sticky='w', padx=8, pady=(8, 0))
             lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color=MUTED, font=self._mono(11))
             lbl.grid(row=row + 1, column=col, sticky='w', padx=8, pady=(0, 6))
@@ -290,71 +327,71 @@ class ConfigScannerApp(ctk.CTk):
 
         self.link_count_label = ctk.CTkLabel(
             self.source_frame, text='0 configs loaded',
-            font=self._mono(14, 'bold'), text_color=CYAN)
-        self.link_count_label.grid(row=6, column=0, padx=18, pady=(4, 16), sticky='w')
+            font=self._mono(14, 'bold'), text_color=ACCENT)
+        self.link_count_label.grid(row=6, column=0, padx=20, pady=(4, 18), sticky='w')
 
     # ---- Setup card ---------------------------------------------------
     def _build_setup_card(self):
-        self.setup_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+        self.setup_frame = ctk.CTkFrame(self.main_frame, fg_color=SURFACE, corner_radius=CARD_R,
                                         border_color=LINE, border_width=1)
         self.setup_frame.grid(row=0, column=1, padx=(8, 0), pady=(0, 12), sticky='nsew')
         self.setup_frame.grid_columnconfigure(0, weight=1)
-        self._accent_stripe(self.setup_frame, MAGENTA)
 
-        self.setup_title = ctk.CTkLabel(self.setup_frame, text=self._spaced('Scan Setup'),
-                                        font=self._mono(12, 'bold'), text_color=CYAN)
-        self.setup_title.grid(row=0, column=0, padx=18, pady=(18, 2), sticky='w')
+        self.setup_title = ctk.CTkLabel(self.setup_frame, text='Scan setup',
+                                        font=self._font(15, 'bold'), text_color=TEXT)
+        self.setup_title.grid(row=0, column=0, padx=20, pady=(18, 2), sticky='w')
 
         self.mode_label = ctk.CTkLabel(self.setup_frame, text='Scan mode',
                                        text_color=MUTED, font=self._font(12))
-        self.mode_label.grid(row=1, column=0, padx=18, pady=(8, 4), sticky='w')
+        self.mode_label.grid(row=1, column=0, padx=20, pady=(8, 4), sticky='w')
 
         self.mode_selector = ctk.CTkSegmentedButton(
             self.setup_frame, values=['Quick', 'Full'], variable=self.scan_mode_var,
             command=lambda _value: self.update_link_count(),
-            selected_color=CYAN, selected_hover_color=CYAN_HOVER,
-            unselected_color=PANEL2, unselected_hover_color=RAISE,
-            text_color=TEXT, fg_color=PANEL2, font=self._mono(13, 'bold'))
-        self.mode_selector.grid(row=2, column=0, padx=18, pady=(0, 12), sticky='ew')
+            selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+            unselected_color=SURFACE2, unselected_hover_color=ELEV,
+            text_color=TEXT, fg_color=SURFACE2, font=self._font(13, 'bold'))
+        self.mode_selector.grid(row=2, column=0, padx=20, pady=(0, 12), sticky='ew')
         self.mode_selector.set('Quick')
 
         self.ultra_switch = ctk.CTkSwitch(
-            self.setup_frame, text='⚡ Ultra Scan',
+            self.setup_frame, text='Ultra scan',
             variable=self.ultra_scan_var, onvalue=True, offvalue=False,
-            progress_color=CYAN, button_color=TEXT, button_hover_color=MUTED,
+            progress_color=ACCENT, button_color=TEXT, button_hover_color=MUTED,
             text_color=TEXT, font=self._font(12))
-        self.ultra_switch.grid(row=3, column=0, padx=18, pady=(0, 14), sticky='w')
+        self.ultra_switch.grid(row=3, column=0, padx=20, pady=(0, 14), sticky='w')
 
         self.select_button = self._secondary_btn(self.setup_frame, 'Choose folder', self.select_folder)
-        self.select_button.grid(row=4, column=0, padx=18, pady=(0, 8), sticky='ew')
+        self.select_button.grid(row=4, column=0, padx=20, pady=(0, 8), sticky='ew')
 
         self.folder_label = ctk.CTkLabel(
             self.setup_frame, text='No folder chosen',
             text_color=MUTED, font=self._mono(11), wraplength=220, justify='left')
-        self.folder_label.grid(row=5, column=0, padx=18, pady=(0, 12), sticky='w')
+        self.folder_label.grid(row=5, column=0, padx=20, pady=(0, 12), sticky='w')
 
         self.start_button = ctk.CTkButton(
             self.setup_frame, text='Start scan', command=self.start_scan, state='disabled',
-            height=46, corner_radius=PILL, fg_color=CYAN, hover_color=CYAN_HOVER,
-            text_color=BG, font=self._font(15, 'bold'))
-        self.start_button.grid(row=6, column=0, padx=18, pady=(0, 10), sticky='ew')
+            height=44, corner_radius=BTN_R, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color=WHITE, font=self._font(15, 'bold'))
+        self.start_button.grid(row=6, column=0, padx=20, pady=(0, 10), sticky='ew')
 
         self.advanced_button = self._secondary_btn(
             self.setup_frame, 'Advanced settings', self.toggle_advanced_settings)
-        self.advanced_button.grid(row=7, column=0, padx=18, pady=(0, 12), sticky='ew')
+        self.advanced_button.grid(row=7, column=0, padx=20, pady=(0, 12), sticky='ew')
 
         self._build_advanced_frame()
 
     def _build_advanced_frame(self):
-        self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=PANEL2, corner_radius=8,
+        self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=SURFACE2, corner_radius=INNER_R,
                                            border_color=LINE, border_width=1)
         self.advanced_frame.grid_columnconfigure((0, 1), weight=1)
 
         def num_entry(default):
-            e = ctk.CTkEntry(self.advanced_frame, fg_color=PANEL, text_color=CYAN,
-                             border_color=LINE, border_width=1, corner_radius=8,
+            e = ctk.CTkEntry(self.advanced_frame, fg_color=BG, text_color=TEXT,
+                             border_color=LINE, border_width=1, corner_radius=INNER_R,
                              font=self._mono(13, 'bold'))
             e.insert(0, default)
+            self._focusable(e)
             return e
 
         def field_label(text):
@@ -379,10 +416,11 @@ class ConfigScannerApp(ctk.CTk):
         # Remark override
         field_label('Remark (optional)').grid(row=4, column=0, padx=10, pady=(6, 4), sticky='w')
         self.remarker_entry = ctk.CTkEntry(
-            self.advanced_frame, textvariable=self.remarker_var, fg_color=PANEL,
-            text_color=TEXT, border_color=LINE, border_width=1, corner_radius=8,
+            self.advanced_frame, textvariable=self.remarker_var, fg_color=BG,
+            text_color=TEXT, border_color=LINE, border_width=1, corner_radius=INNER_R,
             font=self._mono(12))
         self.remarker_entry.grid(row=5, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
+        self._focusable(self.remarker_entry)
 
         # Feature toggles
         self.detect_country_switch = self._switch(self.advanced_frame, 'Detect exit country', self.detect_country_var)
@@ -396,8 +434,8 @@ class ConfigScannerApp(ctk.CTk):
 
         self.site_config_btn = ctk.CTkButton(
             self.advanced_frame, text='Sites…', command=self.open_site_config,
-            width=80, height=28, corner_radius=PILL, fg_color='transparent',
-            border_width=1, border_color=CYAN_DIM, hover_color=RAISE,
+            width=80, height=28, corner_radius=BTN_R, fg_color=BG,
+            border_width=1, border_color=LINE, hover_color=ELEV,
             text_color=TEXT, font=self._font(12))
         self.site_config_btn.grid(row=7, column=1, padx=10, pady=(4, 10), sticky='w')
 
@@ -406,107 +444,280 @@ class ConfigScannerApp(ctk.CTk):
 
     # ---- Progress card ------------------------------------------------
     def _build_progress_card(self):
-        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color=SURFACE, corner_radius=CARD_R,
                                            border_color=LINE, border_width=1)
         self.progress_frame.grid(row=1, column=0, columnspan=2, pady=(0, 12), sticky='ew')
         self.progress_frame.grid_columnconfigure(0, weight=1)
-        self._accent_stripe(self.progress_frame, AMBER)
+
+        self.progress_title = ctk.CTkLabel(self.progress_frame, text='Progress',
+                                           font=self._font(15, 'bold'), text_color=TEXT)
+        self.progress_title.grid(row=0, column=0, padx=20, pady=(18, 2), sticky='w')
 
         self.status = ctk.CTkLabel(self.progress_frame, text='Ready',
-                                   font=self._mono(13, 'bold'), text_color=TEXT)
-        self.status.grid(row=0, column=0, padx=18, pady=(16, 6), sticky='w')
+                                   font=self._font(13), text_color=MUTED)
+        self.status.grid(row=1, column=0, padx=20, pady=(0, 8), sticky='w')
 
         self.progress_bar = ctk.CTkProgressBar(
-            self.progress_frame, progress_color=CYAN, fg_color=PANEL2, height=8, corner_radius=4)
+            self.progress_frame, progress_color=ACCENT, fg_color=SURFACE2, height=8, corner_radius=4)
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=1, column=0, padx=18, pady=(0, 14), sticky='ew')
+        self.progress_bar.grid(row=2, column=0, padx=20, pady=(0, 12), sticky='ew')
+
+        # Live progress sparkline (cumulative tested over time)
+        self.spark_canvas = ctk.CTkCanvas(self.progress_frame, height=64,
+                                          highlightthickness=0, bd=0, bg=SURFACE)
+        self.spark_canvas.grid(row=3, column=0, padx=20, pady=(0, 14), sticky='ew')
+        self.spark_canvas.bind('<Configure>', self._draw_sparkline)
 
         self.controls_frame = ctk.CTkFrame(self.progress_frame, fg_color='transparent')
-        self.controls_frame.grid(row=2, column=0, padx=13, pady=(0, 14), sticky='ew')
+        self.controls_frame.grid(row=4, column=0, padx=15, pady=(0, 16), sticky='ew')
         self.controls_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.pause_button = ctk.CTkButton(
             self.controls_frame, text='Pause', command=self.toggle_pause, state='disabled',
-            corner_radius=PILL, height=38, fg_color=AMBER, hover_color=AMBER_HOVER,
-            text_color=BG, font=self._font(13, 'bold'))
+            corner_radius=BTN_R, height=40, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color=WHITE, font=self._font(13, 'bold'))
         self.pause_button.grid(row=0, column=0, padx=5, sticky='ew')
 
         self.stop_save_button = ctk.CTkButton(
             self.controls_frame, text='Stop and save', command=self.stop_and_save, state='disabled',
-            corner_radius=PILL, height=38, fg_color='transparent', border_width=1,
-            border_color=LINE, hover_color=RAISE, text_color=TEXT, font=self._font(13, 'bold'))
+            corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
+            border_color=LINE, hover_color=ELEV, text_color=TEXT, font=self._font(13, 'bold'))
         self.stop_save_button.grid(row=0, column=1, padx=5, sticky='ew')
 
         self.stop_button = ctk.CTkButton(
             self.controls_frame, text='Stop', command=self.stop_scan_now, state='disabled',
-            corner_radius=PILL, height=38, fg_color='transparent', border_width=1,
-            border_color=RED, hover_color=RAISE, text_color=RED, font=self._font(13, 'bold'))
+            corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
+            border_color=DEAD_DIM, hover_color=ELEV, text_color=DEAD, font=self._font(13, 'bold'))
         self.stop_button.grid(row=0, column=2, padx=5, sticky='ew')
 
-    # ---- Results card -------------------------------------------------
+        self._draw_sparkline()
+
+    # ---- Results card (mini dashboard: donut + tiles + copy) ----------
     def _build_results_card(self):
-        self.results_frame = ctk.CTkFrame(self.main_frame, fg_color=PANEL, corner_radius=RADIUS,
+        self.results_frame = ctk.CTkFrame(self.main_frame, fg_color=SURFACE, corner_radius=CARD_R,
                                           border_color=LINE, border_width=1)
         self.results_frame.grid(row=2, column=0, columnspan=2, sticky='ew')
-        self.results_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
-        self._accent_stripe(self.results_frame, CYAN)
+        self.results_frame.grid_columnconfigure(0, weight=1)
+
+        title = ctk.CTkLabel(self.results_frame, text='Results',
+                             font=self._font(15, 'bold'), text_color=TEXT)
+        title.grid(row=0, column=0, padx=20, pady=(18, 2), sticky='w')
+        sub = ctk.CTkLabel(self.results_frame, text='Live classification of tested configs',
+                           font=self._font(12), text_color=MUTED)
+        sub.grid(row=1, column=0, padx=20, pady=(0, 12), sticky='w')
+
+        content = ctk.CTkFrame(self.results_frame, fg_color='transparent')
+        content.grid(row=2, column=0, padx=20, pady=(0, 4), sticky='ew')
+        content.grid_columnconfigure(1, weight=1)
+
+        # Live donut chart (centerpiece)
+        self.donut_canvas = ctk.CTkCanvas(content, width=200, height=292,
+                                          highlightthickness=0, bd=0, bg=SURFACE)
+        self.donut_canvas.grid(row=0, column=0, padx=(0, 20), pady=0, sticky='n')
+        self.donut_canvas.bind('<Configure>', self._draw_donut)
+
+        # Result tiles (2x2)
+        tiles = ctk.CTkFrame(content, fg_color='transparent')
+        tiles.grid(row=0, column=1, sticky='nsew')
+        tiles.grid_columnconfigure((0, 1), weight=1)
+        tiles.grid_rowconfigure((0, 1), weight=1)
 
         stat_specs = [
-            ('fast_label', 'Fast', FAST_COLOR),
-            ('medium_label', 'Medium', MEDIUM_COLOR),
-            ('slow_label', 'Slow', SLOW_COLOR),
-            ('dead_label', 'Dead', DEAD_COLOR),
+            ('fast_label', 'Fast', FAST),
+            ('medium_label', 'Medium', MEDIUM),
+            ('slow_label', 'Slow', SLOW),
+            ('dead_label', 'Dead', DEAD),
         ]
-        for column, (attr, label, color) in enumerate(stat_specs):
-            tile = ctk.CTkFrame(self.results_frame, fg_color=PANEL2, corner_radius=10,
-                                border_color=color, border_width=1)
-            tile.grid(row=0, column=column, padx=(14 if column == 0 else 6, 6 if column < 3 else 14),
-                      pady=(18, 10), sticky='ew')
-            tile.grid_columnconfigure(0, weight=1)
-            num = ctk.CTkLabel(tile, text='0', text_color=color, font=self._mono(26, 'bold'))
-            num.grid(row=0, column=0, padx=10, pady=(10, 0))
-            cap = ctk.CTkLabel(tile, text=self._spaced(label), text_color=MUTED, font=self._mono(10))
-            cap.grid(row=1, column=0, padx=10, pady=(0, 10))
+        for idx, (attr, label, color) in enumerate(stat_specs):
+            r, cc = idx // 2, idx % 2
+            tile = ctk.CTkFrame(tiles, fg_color=SURFACE2, corner_radius=INNER_R,
+                                border_color=LINE, border_width=1)
+            tile.grid(row=r, column=cc, padx=6, pady=6, sticky='nsew')
+            tile.grid_columnconfigure(1, weight=1)
+            dot = ctk.CTkLabel(tile, text='●', text_color=color, font=self._font(12))
+            dot.grid(row=0, column=0, padx=(16, 6), pady=(14, 0), sticky='w')
+            cap = ctk.CTkLabel(tile, text=label, text_color=MUTED, font=self._font(12))
+            cap.grid(row=0, column=1, padx=(0, 16), pady=(14, 0), sticky='w')
+            num = ctk.CTkLabel(tile, text='0', text_color=color, font=self._mono(28, 'bold'))
+            num.grid(row=1, column=0, columnspan=2, padx=18, pady=(0, 14), sticky='w')
             setattr(self, attr, num)
 
-        self.copy_fast_btn = self._copy_btn('Copy Fast', self.copy_fast)
-        self.copy_fast_btn.grid(row=1, column=0, padx=(14, 5), pady=(0, 16), sticky='ew')
+        # Copy buttons row
+        copy_frame = ctk.CTkFrame(self.results_frame, fg_color='transparent')
+        copy_frame.grid(row=3, column=0, padx=15, pady=(10, 16), sticky='ew')
+        copy_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
-        self.copy_medium_btn = self._copy_btn('Copy Medium', self.copy_medium)
-        self.copy_medium_btn.grid(row=1, column=1, padx=5, pady=(0, 16), sticky='ew')
+        self.copy_fast_btn = self._copy_btn(copy_frame, 'Copy Fast', self.copy_fast)
+        self.copy_fast_btn.grid(row=0, column=0, padx=5, sticky='ew')
 
-        self.copy_slow_btn = self._copy_btn('Copy Slow', self.copy_slow)
-        self.copy_slow_btn.grid(row=1, column=2, padx=5, pady=(0, 16), sticky='ew')
+        self.copy_medium_btn = self._copy_btn(copy_frame, 'Copy Medium', self.copy_medium)
+        self.copy_medium_btn.grid(row=0, column=1, padx=5, sticky='ew')
+
+        self.copy_slow_btn = self._copy_btn(copy_frame, 'Copy Slow', self.copy_slow)
+        self.copy_slow_btn.grid(row=0, column=2, padx=5, sticky='ew')
 
         self.copy_all_btn = ctk.CTkButton(
-            self.results_frame, text='Copy All', command=self.copy_all, state='disabled',
-            corner_radius=PILL, height=38, fg_color=CYAN, hover_color=CYAN_HOVER,
-            text_color=BG, font=self._font(13, 'bold'))
-        self.copy_all_btn.grid(row=1, column=3, padx=(5, 14), pady=(0, 16), sticky='ew')
+            copy_frame, text='Copy All', command=self.copy_all, state='disabled',
+            corner_radius=BTN_R, height=40, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color=WHITE, font=self._font(13, 'bold'))
+        self.copy_all_btn.grid(row=0, column=3, padx=5, sticky='ew')
+
+        # Initial empty-state render
+        self._draw_donut()
 
     # ---- Styled-widget helpers ---------------------------------------
     def _secondary_btn(self, parent, text, command):
-        return ctk.CTkButton(parent, text=text, command=command, corner_radius=PILL,
-                             height=36, fg_color='transparent', border_width=1,
-                             border_color=CYAN_DIM, hover_color=RAISE,
+        return ctk.CTkButton(parent, text=text, command=command, corner_radius=BTN_R,
+                             height=38, fg_color=SURFACE2, border_width=1,
+                             border_color=LINE, hover_color=ELEV,
                              text_color=TEXT, font=self._font(13, 'bold'))
 
     def _danger_btn(self, parent, text, command):
-        return ctk.CTkButton(parent, text=text, command=command, corner_radius=PILL,
-                             height=36, fg_color='transparent', border_width=1,
-                             border_color=RED, hover_color=RAISE,
-                             text_color=RED, font=self._font(13, 'bold'))
+        return ctk.CTkButton(parent, text=text, command=command, corner_radius=BTN_R,
+                             height=38, fg_color=SURFACE2, border_width=1,
+                             border_color=DEAD_DIM, hover_color=ELEV,
+                             text_color=DEAD, font=self._font(13, 'bold'))
 
-    def _copy_btn(self, text, command):
-        return ctk.CTkButton(self.results_frame, text=text, command=command, state='disabled',
-                             corner_radius=PILL, height=38, fg_color='transparent', border_width=1,
-                             border_color=CYAN_DIM, hover_color=RAISE,
+    def _copy_btn(self, parent, text, command):
+        return ctk.CTkButton(parent, text=text, command=command, state='disabled',
+                             corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
+                             border_color=LINE, hover_color=ELEV,
                              text_color=TEXT, font=self._font(13, 'bold'))
 
     def _switch(self, parent, text, variable):
         return ctk.CTkSwitch(parent, text=text, variable=variable, onvalue=True, offvalue=False,
-                             progress_color=CYAN, button_color=TEXT, button_hover_color=MUTED,
+                             progress_color=ACCENT, button_color=TEXT, button_hover_color=MUTED,
                              text_color=TEXT, font=self._font(12))
+
+    def _focusable(self, widget):
+        """Give an input an ACCENT focus border (falls back silently)."""
+        try:
+            widget.bind('<FocusIn>', lambda e: widget.configure(border_color=ACCENT))
+            widget.bind('<FocusOut>', lambda e: widget.configure(border_color=LINE))
+        except Exception:
+            pass
+        return widget
+
+    # ------------------------------------------------------------------
+    # Live graphics — donut chart + progress sparkline
+    # ------------------------------------------------------------------
+    def _draw_donut(self, event=None):
+        c = getattr(self, 'donut_canvas', None)
+        if c is None:
+            return
+        try:
+            if not c.winfo_exists():
+                return
+        except Exception:
+            return
+        c.delete('all')
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1:
+            w = 200
+        if h <= 1:
+            h = 292
+
+        cx = w / 2
+        cy = 96
+        r_out = 82
+        band = 26                      # ring thickness
+        rm = r_out - band / 2          # mid radius the arc stroke follows
+        bbox = (cx - rm, cy - rm, cx + rm, cy + rm)
+
+        fast, medium, slow, dead = self._donut_counts
+        total = fast + medium + slow + dead
+        segs = [(fast, FAST), (medium, MEDIUM), (slow, SLOW), (dead, DEAD)]
+
+        # Background track ring (always visible / neutral empty state)
+        c.create_arc(bbox, start=0, extent=359.999, style='arc',
+                     outline=SURFACE2, width=band)
+
+        if total > 0:
+            gap = 2.0                  # small angular gap between segments
+            start = 90.0               # start at top, go clockwise
+            active = [(v, col) for v, col in segs if v > 0]
+            multi = len(active) > 1
+            for v, col in active:
+                extent = -360.0 * (v / total)
+                draw_extent = extent
+                if multi:
+                    # leave a 2px surface gap between adjacent arcs
+                    draw_extent = extent + gap if extent + gap < 0 else extent
+                if abs(draw_extent) < 0.1:
+                    draw_extent = -0.1
+                # clamp so a full-circle single segment still renders
+                if draw_extent <= -359.999:
+                    draw_extent = -359.999
+                c.create_arc(bbox, start=start, extent=draw_extent, style='arc',
+                             outline=col, width=band)
+                start += extent
+
+        # Center readout
+        c.create_text(cx, cy - 8, text=str(total), fill=TEXT,
+                      font=('Courier New', 30, 'bold'))
+        c.create_text(cx, cy + 20, text='TESTED', fill=MUTED,
+                      font=('Segoe UI', 10))
+
+        # Legend (single column) below the ring
+        entries = [('Fast', fast, FAST), ('Medium', medium, MEDIUM),
+                   ('Slow', slow, SLOW), ('Dead', dead, DEAD)]
+        ly0 = 192
+        lh = 23
+        for i, (lbl, val, col) in enumerate(entries):
+            y = ly0 + i * lh
+            c.create_oval(20, y - 4, 29, y + 5, fill=col, outline='')
+            c.create_text(38, y, text=lbl, anchor='w', fill=MUTED,
+                          font=('Segoe UI', 11))
+            c.create_text(w - 20, y, text=str(val), anchor='e', fill=col,
+                          font=('Courier New', 12, 'bold'))
+
+    def _draw_sparkline(self, event=None):
+        c = getattr(self, 'spark_canvas', None)
+        if c is None:
+            return
+        try:
+            if not c.winfo_exists():
+                return
+        except Exception:
+            return
+        c.delete('all')
+        w = c.winfo_width()
+        h = c.winfo_height()
+        if w <= 1:
+            w = 600
+        if h <= 1:
+            h = 64
+        pad = 6
+
+        # Trough background
+        c.create_rectangle(0, 0, w, h, fill=SURFACE2, outline='')
+
+        samples = list(self._progress_samples)
+        if len(samples) < 2:
+            baseline = h - pad
+            c.create_line(pad, baseline, w - pad, baseline, fill=LINE, width=2)
+            return
+
+        maxt = max((t for t, _ in samples), default=0) or 1.0
+        maxv = max((v for _, v in samples), default=0) or 1.0
+
+        def X(t):
+            return pad + (t / maxt) * (w - 2 * pad)
+
+        def Y(v):
+            return (h - pad) - (v / maxv) * (h - 2 * pad)
+
+        pts = [(X(t), Y(v)) for t, v in samples]
+
+        # Soft translucent-looking fill down to the baseline
+        fill_pts = [(pts[0][0], h - pad)] + pts + [(pts[-1][0], h - pad)]
+        flat_fill = [coord for p in fill_pts for coord in p]
+        c.create_polygon(*flat_fill, fill=ACCENT_DIM, outline='')
+
+        # Accent line on top
+        flat = [coord for p in pts for coord in p]
+        c.create_line(*flat, fill=ACCENT, width=2, smooth=True)
 
     # ------------------------------------------------------------------
     # Site-check configuration popup
@@ -649,7 +860,11 @@ class ConfigScannerApp(ctk.CTk):
                 pass
 
     def set_status(self, text):
-        self.after(0, lambda: self.status.configure(text=text))
+        self.after(0, lambda: self._apply_status(text))
+
+    def _apply_status(self, text):
+        self.status.configure(text=text)
+        self._update_chip(text)
 
     def set_progress(self, value):
         self.after(0, lambda: self.progress_bar.set(value))
@@ -680,6 +895,20 @@ class ConfigScannerApp(ctk.CTk):
         self.medium_label.configure(text=str(medium))
         self.slow_label.configure(text=str(slow))
         self.dead_label.configure(text=str(dead))
+
+        # Feed the live donut
+        self._donut_counts = (fast, medium, slow, dead)
+        self._draw_donut()
+
+        # Feed the live progress sparkline (cumulative tested over time)
+        total = fast + medium + slow + dead
+        if self._scan_t0 is None:
+            self._scan_t0 = time.time()
+        elapsed = time.time() - self._scan_t0
+        self._progress_samples.append((elapsed, total))
+        if len(self._progress_samples) > 240:
+            self._progress_samples = self._progress_samples[-240:]
+        self._draw_sparkline()
 
     def update_link_count(self):
         # Update total loaded count
@@ -1054,6 +1283,10 @@ class ConfigScannerApp(ctk.CTk):
                  timeout, remark_override, ultra, detect_country, retry_failed, site_check,
                  dedupe, site_targets, site_strict):
         try:
+            # Reset live-chart sample tracking for this fresh scan
+            self._scan_t0 = time.time()
+            self._progress_samples = []
+
             # Reset any prior abort flag before starting fresh work
             self.scanner.reset_abort()
 
