@@ -1,9 +1,24 @@
+SINGBOX_PROTOS = ('hysteria', 'hysteria2', 'tuic', 'anytls', 'wireguard')
+
+
+def engine_for(proto):
+    return 'singbox' if proto in SINGBOX_PROTOS else 'xray'
+
+
 def _parse_alpn(value):
     if not value:
         return ['h2', 'http/1.1']
     if isinstance(value, str):
         return [item.strip() for item in value.split(',') if item.strip()]
     return list(value)
+
+
+def _alpn_list(value):
+    if not value:
+        return []
+    if isinstance(value, str):
+        return [item.strip() for item in value.split(',') if item.strip()]
+    return [item for item in value if item]
 
 
 def build_xray_stream_settings(parsed):
@@ -270,68 +285,168 @@ def build_singbox_transport(parsed):
     return None
 
 
+def _make_singbox_outbound(parsed):
+    proto = parsed.get('proto')
+    host = parsed.get('host')
+    port = parsed.get('port')
+    if not host or not port:
+        return None
+    extra = parsed.get('extra', {}) or {}
+    creds = parsed.get('credentials') or ''
+    sni = parsed.get('sni') or host
+
+    if proto == 'hysteria2':
+        password = extra.get('password') or extra.get('auth') or creds
+        if not password:
+            return None
+        outbound = {
+            'type': 'hysteria2',
+            'tag': 'proxy',
+            'server': host,
+            'server_port': port,
+            'password': password
+        }
+        if extra.get('obfs'):
+            outbound['obfs'] = {
+                'type': 'salamander',
+                'password': extra.get('obfs_password') or ''
+            }
+        tls = {
+            'enabled': True,
+            'server_name': sni,
+            'insecure': True
+        }
+        alpn = _alpn_list(extra.get('alpn'))
+        if alpn:
+            tls['alpn'] = alpn
+        outbound['tls'] = tls
+        return outbound
+
+    if proto == 'hysteria':
+        auth = extra.get('auth') or creds
+        if not auth:
+            return None
+        outbound = {
+            'type': 'hysteria',
+            'tag': 'proxy',
+            'server': host,
+            'server_port': port,
+            'auth_str': auth,
+            'up_mbps': _to_int(extra.get('up_mbps'), 50),
+            'down_mbps': _to_int(extra.get('down_mbps'), 100)
+        }
+        if extra.get('obfs'):
+            outbound['obfs'] = extra['obfs']
+        tls = {
+            'enabled': True,
+            'server_name': sni,
+            'insecure': True
+        }
+        alpn = _alpn_list(extra.get('alpn'))
+        if alpn:
+            tls['alpn'] = alpn
+        outbound['tls'] = tls
+        return outbound
+
+    if proto == 'tuic':
+        uuid = extra.get('uuid') or creds
+        password = extra.get('password') or ''
+        if not uuid:
+            return None
+        alpn = _alpn_list(extra.get('alpn')) or ['h3']
+        outbound = {
+            'type': 'tuic',
+            'tag': 'proxy',
+            'server': host,
+            'server_port': port,
+            'uuid': uuid,
+            'password': password,
+            'congestion_control': extra.get('congestion_control') or 'bbr',
+            'udp_relay_mode': 'native',
+            'tls': {
+                'enabled': True,
+                'server_name': sni,
+                'insecure': True,
+                'alpn': alpn
+            }
+        }
+        return outbound
+
+    if proto == 'anytls':
+        password = extra.get('password') or creds
+        if not password:
+            return None
+        outbound = {
+            'type': 'anytls',
+            'tag': 'proxy',
+            'server': host,
+            'server_port': port,
+            'password': password,
+            'tls': {
+                'enabled': True,
+                'server_name': sni,
+                'insecure': True
+            }
+        }
+        return outbound
+
+    if proto == 'wireguard':
+        private_key = extra.get('private_key') or creds
+        peer_public_key = extra.get('peer_public_key') or ''
+        if not private_key or not peer_public_key:
+            return None
+        address = extra.get('address')
+        if isinstance(address, str):
+            local_address = [a.strip() for a in address.split(',') if a.strip()]
+        elif isinstance(address, (list, tuple)):
+            local_address = [a for a in address if a]
+        else:
+            local_address = []
+        if not local_address:
+            local_address = ['172.16.0.2/32']
+        outbound = {
+            'type': 'wireguard',
+            'tag': 'proxy',
+            'server': host,
+            'server_port': port,
+            'private_key': private_key,
+            'peer_public_key': peer_public_key,
+            'local_address': local_address
+        }
+        return outbound
+
+    return None
+
+
+def _to_int(value, default):
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return default
+
+
 def make_singbox_config(parsed, local_port):
     if not parsed:
         return None
 
-    outbound = {
-        'tag': 'proxy',
-        'server': parsed['host'],
-        'server_port': parsed['port']
-    }
-
-    if parsed['proto'] == 'ss':
-        outbound['type'] = 'shadowsocks'
-        method, password = parsed['credentials'].split(':', 1) if ':' in parsed['credentials'] else ('aes-256-gcm', parsed['credentials'])
-        outbound['method'] = method
-        outbound['password'] = password
-    elif parsed['proto'] == 'vmess':
-        outbound['type'] = 'vmess'
-        outbound['uuid'] = parsed['credentials']
-        outbound['alter_id'] = 0
-        outbound['security'] = 'auto'
-    elif parsed['proto'] == 'vless':
-        outbound['type'] = 'vless'
-        outbound['uuid'] = parsed['credentials']
-        if parsed.get('flow'):
-            outbound['flow'] = parsed['flow']
-    elif parsed['proto'] == 'trojan':
-        outbound['type'] = 'trojan'
-        outbound['password'] = parsed['credentials']
-
-    security_mode = parsed.get('security_mode', 'none')
-    if security_mode == 'xtls':
-        outbound['xtls'] = {
-            'enabled': True,
-            'server_name': parsed.get('sni') or parsed.get('host', ''),
-            'allow_insecure': True
-        }
-        if parsed.get('flow'):
-            outbound['xtls']['flow'] = parsed.get('flow')
-        if parsed.get('extra', {}).get('alpn'):
-            outbound['xtls']['alpn'] = _parse_alpn(parsed['extra']['alpn'])
-    elif parsed.get('is_tls'):
-        outbound['tls'] = {
-            'enabled': True,
-            'server_name': parsed.get('sni') or parsed.get('host', ''),
-            'insecure': True
-        }
-        if parsed.get('extra', {}).get('alpn'):
-            outbound['tls']['alpn'] = _parse_alpn(parsed['extra']['alpn'])
-
-    transport = build_singbox_transport(parsed)
-    if transport:
-        outbound['transport'] = transport
+    outbound = _make_singbox_outbound(parsed)
+    if not outbound:
+        return None
 
     config = {
-        'log': {'level': 'panic'},
+        'log': {'disabled': True},
         'inbounds': [
             {
                 'type': 'http',
+                'tag': 'in',
                 'listen': '127.0.0.1',
                 'listen_port': local_port
             }
         ],
-        'outbounds': [outbound]
+        'outbounds': [
+            outbound,
+            {'type': 'direct', 'tag': 'direct'}
+        ],
+        'route': {'final': 'proxy'}
     }
     return config

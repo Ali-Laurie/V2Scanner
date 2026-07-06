@@ -35,6 +35,7 @@ class Scanner:
         # Set by ui.run_scan before each scan (features A and B).
         self.detect_country = False
         self.site_check = False
+        self.site_strict = False
         self.site_targets = []
 
     def request_abort(self):
@@ -172,9 +173,38 @@ class Scanner:
                 self._active_procs.discard(proc)
 
     def _validate_singbox_config(self, binary_path, config_path):
+        # Mirror _validate_xray_config: run `sing-box check` via a REGISTERED
+        # Popen so request_abort() can kill an in-flight validation immediately.
         try:
-            result = subprocess.run([binary_path, 'check', '-c', config_path], stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
-            return result.returncode == 0
+            proc = subprocess.Popen(
+                [binary_path, 'check', '-c', config_path],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW
+            )
+        except Exception:
+            return False
+        with self._proc_lock:
+            self._active_procs.add(proc)
+        try:
+            try:
+                out, err = proc.communicate(timeout=10)
+            except subprocess.TimeoutExpired:
+                try:
+                    proc.kill()
+                    proc.communicate()
+                except Exception:
+                    pass
+                return False
+            if proc.returncode != 0:
+                try:
+                    debug_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Core', 'singbox_config_test.log'))
+                    with open(debug_path, 'a', encoding='utf-8') as df:
+                        df.write(f"[SINGBOX_TEST_FAIL] cmd={[binary_path, 'check', '-c', config_path]}\n")
+                        df.write(out.decode('utf-8', errors='ignore') + '\n')
+                        df.write(err.decode('utf-8', errors='ignore') + '\n')
+                except Exception:
+                    pass
+            return proc.returncode == 0
         except Exception:
             try:
                 debug_path = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..', 'Core', 'singbox_config_test.log'))
@@ -183,6 +213,9 @@ class Scanner:
             except Exception:
                 pass
             return False
+        finally:
+            with self._proc_lock:
+                self._active_procs.discard(proc)
 
     def _measure_proxy(self, local_port, timeout, quick=False):
         proxy_url = f'http://127.0.0.1:{local_port}'
@@ -350,11 +383,13 @@ class Scanner:
         }
 
     def _build_config(self, parsed, local_port, engine):
-        if engine == 'xray':
-            return configs.make_xray_config(parsed, local_port)
-        return None
+        if engine == 'singbox':
+            return configs.make_singbox_config(parsed, local_port)
+        return configs.make_xray_config(parsed, local_port)
 
     def _validate_config(self, binary_path, config_path, engine):
+        if engine == 'singbox':
+            return self._validate_singbox_config(binary_path, config_path)
         return self._validate_xray_config(binary_path, config_path)
 
     def _test_core(self, parsed, timeout, binary_path, engine, quick=False, prevalidated=False):
@@ -379,7 +414,10 @@ class Scanner:
                 self._cleanup_process(None, config_path)
                 return None
 
-            args = [binary_path, '-c', config_path]
+            if engine == 'singbox':
+                args = [binary_path, 'run', '-c', config_path]
+            else:
+                args = [binary_path, '-c', config_path]
             proc = self._run_core_process(args)
             if not proc:
                 self._cleanup_process(proc, config_path)
@@ -398,6 +436,13 @@ class Scanner:
                 if metrics['success_ratio'] < 0.3 and metrics['download_kbps'] < 1.0:
                     return None
 
+                # Strict site-check: the config must reach EVERY target site or
+                # it is treated as dead. Only enforced when strict mode is on.
+                if self.site_check and self.site_strict and self.site_targets:
+                    required = {name for name, _ in self.site_targets}
+                    if not required.issubset(set(metrics.get('sites_ok', []))):
+                        return None
+
                 return self._build_benchmark_result(parsed.get('link', ''), parsed, engine, metrics)
             finally:
                 self._cleanup_process(proc, config_path)
@@ -413,10 +458,14 @@ class Scanner:
         if not valid:
             return {'ok': False, 'link': link, 'reason': reason or 'parser_validation_failed'}
 
-        if parsed.get('proto') in ('hysteria', 'hysteria2'):
-            return {'ok': False, 'link': link, 'reason': 'xray_unsupported_protocol'}
-
         parsed['link'] = link
+
+        # sing-box protocols (hysteria/hysteria2/tuic/anytls/wireguard) are UDP/QUIC
+        # based, so a TCP reachability probe is meaningless (and would falsely reject
+        # them). Skip the TCP precheck and let the real sing-box test decide liveness.
+        if configs.engine_for(parsed.get('proto')) == 'singbox':
+            return {'ok': True, 'link': link, 'parsed': parsed}
+
         try:
             with socket.create_connection((parsed['host'], parsed['port']), timeout=timeout):
                 return {'ok': True, 'link': link, 'parsed': parsed}
@@ -493,11 +542,15 @@ class Scanner:
     def validate_and_test(self, item, timeout, method):
         parsed = item.get('parsed')
         link = item.get('link', '')
-        if self._aborted or not parsed or not os.path.exists(self.xray_path):
+        if self._aborted or not parsed:
+            return None
+        engine = configs.engine_for(parsed['proto'])
+        binary = self.singbox_path if engine == 'singbox' else self.xray_path
+        if not os.path.exists(binary):
             return None
         quick = (method != 'xray')   # 'fast' -> quick=True ; 'xray' -> quick=False
-        # _test_core with prevalidated=False performs xray -test validation, then launches & measures.
-        result = self._test_core(parsed, timeout, self.xray_path, 'xray', quick=quick, prevalidated=False)
+        # _test_core with prevalidated=False performs core validation, then launches & measures.
+        result = self._test_core(parsed, timeout, binary, engine, quick=quick, prevalidated=False)
         if result:
             result['method'] = method   # preserve the run's method label ('fast'/'xray')
         return result

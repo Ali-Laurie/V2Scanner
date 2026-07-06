@@ -3,17 +3,37 @@ import json
 import os
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed, wait, FIRST_COMPLETED
 from tkinter import filedialog, StringVar, BooleanVar, Listbox, END
 
 import customtkinter as ctk
-import re
-import webbrowser
 import sys
 
 from .parser import extract_links, resolve_source, parse_link
 from .scanner import Scanner
 from . import engine
+from . import naming
+
+
+# ---------------------------------------------------------------------------
+# Design system (Spotify-like dark theme)
+# ---------------------------------------------------------------------------
+BG = '#121212'
+CARD = '#181818'
+CARD2 = '#1e1e1e'
+HOVER = '#282828'
+HOVER_LIGHT = '#333333'
+ACCENT = '#1DB954'
+ACCENT_HOVER = '#1ed760'
+TEXT = '#FFFFFF'
+MUTED = '#B3B3B3'
+DANGER = '#E22134'
+DANGER_HOVER = '#b71a29'
+WARN = '#F0A500'
+WARN_HOVER = '#c98700'
+SLOW = '#9f7aea'
+BORDER = '#2a2a2a'
+RADIUS = 12
+PILL = 20
 
 
 ctk.set_appearance_mode('dark')
@@ -24,15 +44,17 @@ class ConfigScannerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title('ScanV2Ray')
-        self.geometry('840x900')
-        self.minsize(820, 820)
+        self.geometry('900x920')
+        self.minsize(820, 600)
+        self.configure(fg_color=BG)
 
         self.folder_path = None
         self.loaded_links = set()
         self.link_protocols = {}
         self.fast_links = []
-        self.normal_links = []
-        self.active_links = []
+        self.medium_links = []
+        self.slow_links = []
+        self.active = []
         self.scan_state = 'idle'
         self.pause_cond = threading.Condition()
         self.log_lock = threading.Lock()
@@ -57,42 +79,41 @@ class ConfigScannerApp(ctk.CTk):
         self.site_check_var = BooleanVar(value=False)
         self.dedupe_var = BooleanVar(value=True)
 
+        # Site-check configuration
+        self.site_targets_default = [
+            ('YouTube', 'https://www.youtube.com'),
+            ('Instagram', 'https://www.instagram.com'),
+            ('Telegram', 'https://web.telegram.org'),
+            ('ChatGPT', 'https://chatgpt.com'),
+            ('Google', 'https://www.google.com'),
+        ]
+        self.site_urls = {name: url for name, url in self.site_targets_default}
+        self.site_vars = {name: BooleanVar(value=True) for name, _ in self.site_targets_default}
+        self.site_custom = []  # list of custom names appended to site_urls/site_vars
+        self.site_strict_var = BooleanVar(value=True)
+        self.site_popup = None
+
         self._build_ui()
-        # Load About.md info for Donate popup
-        try:
-            self.about_info = self._load_about_info()
-        except Exception:
-            self.about_info = {}
+
+    # ------------------------------------------------------------------
+    # UI construction
+    # ------------------------------------------------------------------
+    def _font(self, size=13, weight='normal'):
+        return ctk.CTkFont(size=size, weight=weight)
 
     def _build_ui(self):
         self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(2, weight=1)
+        self.grid_rowconfigure(1, weight=1)
 
-        self.header_frame = ctk.CTkFrame(self, fg_color='transparent')
-        self.header_frame.grid(row=0, column=0, padx=24, pady=(18, 8), sticky='ew')
-        self.header_frame.grid_columnconfigure(0, weight=1)
+        self._build_header()
 
-        self.header = ctk.CTkLabel(
-            self.header_frame,
-            text='ScanV2Ray',
-            font=ctk.CTkFont(size=28, weight='bold')
-        )
-        self.header.grid(row=0, column=0, sticky='w')
-        # Donate button
-        self.header_frame.grid_columnconfigure(1, weight=0)
-        self.donate_btn = ctk.CTkButton(self.header_frame, text='Donate', command=self.open_donate_popup, fg_color='#b7791f')
-        self.donate_btn.grid(row=0, column=1, sticky='e')
+        # Scrollable body so the full layout works on any screen size.
+        self.scroll = ctk.CTkScrollableFrame(self, fg_color='transparent')
+        self.scroll.grid(row=1, column=0, sticky='nsew')
+        self.scroll.grid_columnconfigure(0, weight=1)
 
-        self.subtitle = ctk.CTkLabel(
-            self.header_frame,
-            text='Import proxy configs, scan them with Xray, and export the working results.',
-            text_color='#aab2bd',
-            font=ctk.CTkFont(size=13)
-        )
-        self.subtitle.grid(row=1, column=0, sticky='w', pady=(2, 0))
-
-        self.main_frame = ctk.CTkFrame(self, fg_color='transparent')
-        self.main_frame.grid(row=1, column=0, padx=24, pady=8, sticky='nsew')
+        self.main_frame = ctk.CTkFrame(self.scroll, fg_color='transparent')
+        self.main_frame.grid(row=0, column=0, padx=24, pady=8, sticky='ew')
         self.main_frame.grid_columnconfigure(0, weight=1)
         self.main_frame.grid_columnconfigure(1, weight=1)
 
@@ -101,410 +122,419 @@ class ConfigScannerApp(ctk.CTk):
         self._build_progress_card()
         self._build_results_card()
 
-        self.log_frame = ctk.CTkFrame(self)
-        self.log_frame.grid(row=2, column=0, padx=24, pady=(4, 18), sticky='nsew')
+        self.log_frame = ctk.CTkFrame(self.scroll, fg_color=CARD, corner_radius=RADIUS)
+        self.log_frame.grid(row=1, column=0, padx=24, pady=(4, 18), sticky='ew')
         self.log_frame.grid_columnconfigure(0, weight=1)
         self.log_frame.grid_rowconfigure(1, weight=1)
 
-        self.log_label = ctk.CTkLabel(self.log_frame, text='Activity log', font=ctk.CTkFont(size=14, weight='bold'))
-        self.log_label.grid(row=0, column=0, padx=14, pady=(12, 4), sticky='w')
+        self.log_label = ctk.CTkLabel(self.log_frame, text='Activity log',
+                                      font=self._font(15, 'bold'), text_color=TEXT)
+        self.log_label.grid(row=0, column=0, padx=18, pady=(14, 4), sticky='w')
 
-        self.box = ctk.CTkTextbox(self.log_frame, height=180, wrap='word')
-        self.box.grid(row=1, column=0, padx=14, pady=(0, 14), sticky='nsew')
+        self.box = ctk.CTkTextbox(self.log_frame, height=170, wrap='word',
+                                  fg_color=CARD2, text_color=MUTED,
+                                  border_color=BORDER, border_width=1, corner_radius=8)
+        self.box.grid(row=1, column=0, padx=18, pady=(0, 18), sticky='nsew')
 
+    def _build_header(self):
+        self.header_frame = ctk.CTkFrame(self, fg_color='transparent')
+        self.header_frame.grid(row=0, column=0, padx=24, pady=(20, 8), sticky='ew')
+        self.header_frame.grid_columnconfigure(1, weight=1)
+
+        self.logo_dot = ctk.CTkFrame(self.header_frame, width=16, height=16,
+                                     fg_color=ACCENT, corner_radius=8)
+        self.logo_dot.grid(row=0, column=0, sticky='w', padx=(0, 12), pady=(4, 0))
+        self.logo_dot.grid_propagate(False)
+
+        self.header = ctk.CTkLabel(self.header_frame, text='ScanV2Ray',
+                                   font=self._font(30, 'bold'), text_color=TEXT)
+        self.header.grid(row=0, column=1, sticky='w')
+
+        self.subtitle = ctk.CTkLabel(
+            self.header_frame,
+            text='Import proxy configs, scan them with Xray, and export the working results.',
+            text_color=MUTED, font=self._font(13))
+        self.subtitle.grid(row=1, column=1, sticky='w', pady=(2, 0))
+
+    # ---- Sources card -------------------------------------------------
     def _build_sources_card(self):
-        self.source_frame = ctk.CTkFrame(self.main_frame)
+        self.source_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
         self.source_frame.grid(row=0, column=0, padx=(0, 8), pady=(0, 12), sticky='nsew')
         self.source_frame.grid_columnconfigure(0, weight=1)
 
-        self.source_title = ctk.CTkLabel(self.source_frame, text='Sources', font=ctk.CTkFont(size=15, weight='bold'))
-        self.source_title.grid(row=0, column=0, padx=14, pady=(12, 2), sticky='w')
+        self.source_title = ctk.CTkLabel(self.source_frame, text='Sources',
+                                         font=self._font(15, 'bold'), text_color=TEXT)
+        self.source_title.grid(row=0, column=0, padx=18, pady=(16, 2), sticky='w')
 
         self.source_hint = ctk.CTkLabel(
             self.source_frame,
             text='Paste links, subscription URLs, base64 text, JSON, or local file paths.',
-            text_color='#aab2bd',
-            wraplength=360,
-            justify='left'
-        )
-        self.source_hint.grid(row=1, column=0, padx=14, pady=(0, 8), sticky='w')
+            text_color=MUTED, font=self._font(12), wraplength=360, justify='left')
+        self.source_hint.grid(row=1, column=0, padx=18, pady=(0, 10), sticky='w')
 
-        self.source_textbox = ctk.CTkTextbox(self.source_frame, height=110, wrap='word')
-        self.source_textbox.grid(row=2, column=0, padx=14, pady=(0, 8), sticky='ew')
+        self.source_textbox = ctk.CTkTextbox(self.source_frame, height=100, wrap='word',
+                                             fg_color=CARD2, text_color=TEXT,
+                                             border_color=BORDER, border_width=1, corner_radius=8)
+        self.source_textbox.grid(row=2, column=0, padx=18, pady=(0, 8), sticky='ew')
 
         # Visible list of loaded sources (so user can see and remove selections)
-        self.sources_listbox = Listbox(self.source_frame, height=6, selectmode='extended')
-        self.sources_listbox.grid(row=3, column=0, padx=14, pady=(0, 8), sticky='ew')
+        self.sources_listbox = Listbox(
+            self.source_frame, height=6, selectmode='extended',
+            background=CARD2, foreground=TEXT, borderwidth=0, highlightthickness=1,
+            highlightbackground=BORDER, selectbackground=ACCENT, selectforeground='#000000',
+            activestyle='none', font=('TkDefaultFont', 9))
+        self.sources_listbox.grid(row=3, column=0, padx=18, pady=(0, 10), sticky='ew')
 
         self.source_actions = ctk.CTkFrame(self.source_frame, fg_color='transparent')
-        self.source_actions.grid(row=4, column=0, padx=9, pady=(0, 8), sticky='ew')
-        self.source_actions.grid_columnconfigure((0, 1, 2, 3), weight=1)
+        self.source_actions.grid(row=4, column=0, padx=13, pady=(0, 10), sticky='ew')
+        self.source_actions.grid_columnconfigure((0, 1), weight=1)
 
-        self.add_links_btn = ctk.CTkButton(self.source_actions, text='Add pasted sources', command=self.add_manual_sources)
-        self.add_links_btn.grid(row=0, column=0, padx=5, sticky='ew')
+        self.add_links_btn = self._secondary_btn(self.source_actions, 'Add pasted', self.add_manual_sources)
+        self.add_links_btn.grid(row=0, column=0, padx=5, pady=(0, 6), sticky='ew')
 
-        self.add_files_btn = ctk.CTkButton(self.source_actions, text='Add files', command=self.add_files)
-        self.add_files_btn.grid(row=0, column=1, padx=5, sticky='ew')
+        self.add_files_btn = self._secondary_btn(self.source_actions, 'Add files', self.add_files)
+        self.add_files_btn.grid(row=0, column=1, padx=5, pady=(0, 6), sticky='ew')
 
-        self.remove_selected_btn = ctk.CTkButton(
-            self.source_actions,
-            text='Remove selected',
-            command=self.remove_selected_sources,
-            fg_color='#c53030',
-            hover_color='#9b2c2c'
-        )
-        self.remove_selected_btn.grid(row=0, column=2, padx=5, sticky='ew')
+        self.remove_selected_btn = self._danger_btn(self.source_actions, 'Remove selected', self.remove_selected_sources)
+        self.remove_selected_btn.grid(row=1, column=0, padx=5, sticky='ew')
 
-        self.clear_sources_btn = ctk.CTkButton(
-            self.source_actions,
-            text='Clear',
-            command=self.clear_sources,
-            fg_color='#3b4252',
-            hover_color='#4c566a'
-        )
-        self.clear_sources_btn.grid(row=0, column=3, padx=5, sticky='ew')
+        self.clear_sources_btn = self._secondary_btn(self.source_actions, 'Clear', self.clear_sources)
+        self.clear_sources_btn.grid(row=1, column=1, padx=5, sticky='ew')
 
         # Protocol filters and counts
-        self.protocols = ['vmess', 'vless', 'ss', 'trojan', 'socks', 'http']
+        self.protocols = ['vmess', 'vless', 'ss', 'trojan', 'socks', 'http',
+                          'hysteria2', 'tuic', 'anytls']
         self.protocol_vars = {p: StringVar(value='1') for p in self.protocols}
         self.protocol_count_labels = {}
 
-        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color='transparent')
-        self.protocols_frame.grid(row=5, column=0, padx=14, pady=(6, 6), sticky='ew')
-        self.protocols_frame.grid_columnconfigure(tuple(range(len(self.protocols))), weight=1)
+        self.protocols_frame = ctk.CTkFrame(self.source_frame, fg_color=CARD2, corner_radius=8)
+        self.protocols_frame.grid(row=5, column=0, padx=18, pady=(6, 6), sticky='ew')
+        ncols = 5
+        for c in range(ncols):
+            self.protocols_frame.grid_columnconfigure(c, weight=1)
 
         for i, proto in enumerate(self.protocols):
-            chk = ctk.CTkCheckBox(self.protocols_frame, text=proto.upper(), variable=self.protocol_vars[proto], onvalue='1', offvalue='0', command=self.update_link_count)
-            chk.grid(row=0, column=i, sticky='w')
-            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color='#aab2bd')
-            lbl.grid(row=1, column=i, sticky='w', pady=(4, 0))
+            row = (i // ncols) * 2
+            col = i % ncols
+            chk = ctk.CTkCheckBox(
+                self.protocols_frame, text=proto.upper(), variable=self.protocol_vars[proto],
+                onvalue='1', offvalue='0', command=self.update_link_count,
+                font=self._font(11), text_color=TEXT, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                checkmark_color='#000000', border_color=MUTED, checkbox_width=18, checkbox_height=18)
+            chk.grid(row=row, column=col, sticky='w', padx=8, pady=(8, 0))
+            lbl = ctk.CTkLabel(self.protocols_frame, text='0', text_color=MUTED, font=self._font(11))
+            lbl.grid(row=row + 1, column=col, sticky='w', padx=8, pady=(0, 6))
             self.protocol_count_labels[proto] = lbl
 
         self.link_count_label = ctk.CTkLabel(
-            self.source_frame,
-            text='0 configs loaded',
-            font=ctk.CTkFont(size=13, weight='bold')
-        )
-        self.link_count_label.grid(row=6, column=0, padx=14, pady=(0, 12), sticky='w')
+            self.source_frame, text='0 configs loaded',
+            font=self._font(13, 'bold'), text_color=ACCENT)
+        self.link_count_label.grid(row=6, column=0, padx=18, pady=(4, 16), sticky='w')
 
+    # ---- Setup card ---------------------------------------------------
     def _build_setup_card(self):
-        self.setup_frame = ctk.CTkFrame(self.main_frame)
+        self.setup_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
         self.setup_frame.grid(row=0, column=1, padx=(8, 0), pady=(0, 12), sticky='nsew')
         self.setup_frame.grid_columnconfigure(0, weight=1)
 
-        self.setup_title = ctk.CTkLabel(self.setup_frame, text='Scan setup', font=ctk.CTkFont(size=15, weight='bold'))
-        self.setup_title.grid(row=0, column=0, padx=14, pady=(12, 2), sticky='w')
+        self.setup_title = ctk.CTkLabel(self.setup_frame, text='Scan setup',
+                                        font=self._font(15, 'bold'), text_color=TEXT)
+        self.setup_title.grid(row=0, column=0, padx=18, pady=(16, 2), sticky='w')
 
-        self.mode_label = ctk.CTkLabel(self.setup_frame, text='Scan mode', text_color='#aab2bd')
-        self.mode_label.grid(row=1, column=0, padx=14, pady=(8, 4), sticky='w')
+        self.mode_label = ctk.CTkLabel(self.setup_frame, text='Scan mode',
+                                       text_color=MUTED, font=self._font(12))
+        self.mode_label.grid(row=1, column=0, padx=18, pady=(8, 4), sticky='w')
 
         self.mode_selector = ctk.CTkSegmentedButton(
-            self.setup_frame,
-            values=['Quick', 'Full'],
-            variable=self.scan_mode_var,
-            command=lambda _value: self.update_link_count()
-        )
-        self.mode_selector.grid(row=2, column=0, padx=14, pady=(0, 12), sticky='ew')
+            self.setup_frame, values=['Quick', 'Full'], variable=self.scan_mode_var,
+            command=lambda _value: self.update_link_count(),
+            selected_color=ACCENT, selected_hover_color=ACCENT_HOVER,
+            unselected_color=CARD2, unselected_hover_color=HOVER,
+            text_color=TEXT, fg_color=CARD2, font=self._font(13, 'bold'))
+        self.mode_selector.grid(row=2, column=0, padx=18, pady=(0, 12), sticky='ew')
         self.mode_selector.set('Quick')
 
         self.ultra_switch = ctk.CTkSwitch(
-            self.setup_frame,
-            text='⚡ Ultra Scan (faster real-test • more CPU/network)',
-            variable=self.ultra_scan_var,
-            onvalue=True, offvalue=False
-        )
-        self.ultra_switch.grid(row=3, column=0, padx=14, pady=(0, 12), sticky='w')
+            self.setup_frame, text='⚡ Ultra Scan',
+            variable=self.ultra_scan_var, onvalue=True, offvalue=False,
+            progress_color=ACCENT, button_color=TEXT, button_hover_color=MUTED,
+            text_color=TEXT, font=self._font(12))
+        self.ultra_switch.grid(row=3, column=0, padx=18, pady=(0, 14), sticky='w')
 
-        self.select_button = ctk.CTkButton(
-            self.setup_frame,
-            text='Choose output folder',
-            command=self.select_folder,
-            font=ctk.CTkFont(weight='bold')
-        )
-        self.select_button.grid(row=4, column=0, padx=14, pady=(0, 8), sticky='ew')
+        self.select_button = self._secondary_btn(self.setup_frame, 'Choose folder', self.select_folder)
+        self.select_button.grid(row=4, column=0, padx=18, pady=(0, 8), sticky='ew')
 
         self.folder_label = ctk.CTkLabel(
-            self.setup_frame,
-            text='No output folder selected',
-            text_color='#aab2bd',
-            wraplength=360,
-            justify='left'
-        )
-        self.folder_label.grid(row=5, column=0, padx=14, pady=(0, 12), sticky='w')
+            self.setup_frame, text='No output folder selected',
+            text_color=MUTED, font=self._font(12), wraplength=360, justify='left')
+        self.folder_label.grid(row=5, column=0, padx=18, pady=(0, 12), sticky='w')
 
         self.start_button = ctk.CTkButton(
-            self.setup_frame,
-            text='Start scan',
-            command=self.start_scan,
-            state='disabled',
-            height=40,
-            font=ctk.CTkFont(size=14, weight='bold')
-        )
-        self.start_button.grid(row=6, column=0, padx=14, pady=(0, 10), sticky='ew')
+            self.setup_frame, text='Start scan', command=self.start_scan, state='disabled',
+            height=44, corner_radius=PILL, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color='#000000', font=self._font(15, 'bold'))
+        self.start_button.grid(row=6, column=0, padx=18, pady=(0, 10), sticky='ew')
 
-        self.advanced_button = ctk.CTkButton(
-            self.setup_frame,
-            text='Show advanced settings',
-            command=self.toggle_advanced_settings,
-            fg_color='#3b4252',
-            hover_color='#4c566a'
-        )
-        self.advanced_button.grid(row=7, column=0, padx=14, pady=(0, 10), sticky='ew')
+        self.advanced_button = self._secondary_btn(
+            self.setup_frame, 'Advanced settings', self.toggle_advanced_settings)
+        self.advanced_button.grid(row=7, column=0, padx=18, pady=(0, 12), sticky='ew')
 
-        self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color='#232936')
+        self._build_advanced_frame()
+
+    def _build_advanced_frame(self):
+        self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=CARD2, corner_radius=8)
         self.advanced_frame.grid_columnconfigure((0, 1), weight=1)
 
-        self.threads_label = ctk.CTkLabel(self.advanced_frame, text='Concurrency')
-        self.threads_label.grid(row=0, column=0, padx=10, pady=(10, 4), sticky='w')
-        self.threads_entry = ctk.CTkEntry(self.advanced_frame)
-        self.threads_entry.insert(0, '40')
-        self.threads_entry.grid(row=1, column=0, padx=10, pady=(0, 10), sticky='ew')
+        def num_entry(default):
+            e = ctk.CTkEntry(self.advanced_frame, fg_color=CARD, text_color=TEXT,
+                             border_color=BORDER, border_width=1, corner_radius=8)
+            e.insert(0, default)
+            return e
 
-        self.timeout_label = ctk.CTkLabel(self.advanced_frame, text='Timeout (ms)')
-        self.timeout_label.grid(row=0, column=1, padx=10, pady=(10, 4), sticky='w')
-        self.timeout_entry = ctk.CTkEntry(self.advanced_frame)
-        self.timeout_entry.insert(0, '3000')
-        self.timeout_entry.grid(row=1, column=1, padx=10, pady=(0, 10), sticky='ew')
+        def field_label(text):
+            return ctk.CTkLabel(self.advanced_frame, text=text, text_color=MUTED, font=self._font(12))
 
-        # Remark: optional override for all config remarks
-        self.remarker_label = ctk.CTkLabel(self.advanced_frame, text='Remark (optional)')
-        self.remarker_label.grid(row=2, column=0, padx=10, pady=(6, 4), sticky='w')
-        self.remarker_entry = ctk.CTkEntry(self.advanced_frame, textvariable=self.remarker_var)
-        self.remarker_entry.insert(0, '')
-        self.remarker_entry.grid(row=3, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
+        # Row 0/1: precheck workers | test workers
+        field_label('Precheck workers').grid(row=0, column=0, padx=10, pady=(12, 4), sticky='w')
+        field_label('Test workers').grid(row=0, column=1, padx=10, pady=(12, 4), sticky='w')
+        self.precheck_entry = num_entry('200')
+        self.precheck_entry.grid(row=1, column=0, padx=10, pady=(0, 8), sticky='ew')
+        self.test_entry = num_entry('16')
+        self.test_entry.grid(row=1, column=1, padx=10, pady=(0, 8), sticky='ew')
 
-        # Feature toggles (each independently switchable)
-        self.detect_country_switch = ctk.CTkSwitch(
-            self.advanced_frame,
-            text='Detect exit country',
-            variable=self.detect_country_var,
-            onvalue=True, offvalue=False
-        )
-        self.detect_country_switch.grid(row=4, column=0, padx=10, pady=(4, 4), sticky='w')
+        # Row 2/3: speed-test slots | timeout
+        field_label('Speed-test slots').grid(row=2, column=0, padx=10, pady=(6, 4), sticky='w')
+        field_label('Timeout (ms)').grid(row=2, column=1, padx=10, pady=(6, 4), sticky='w')
+        self.speed_entry = num_entry('6')
+        self.speed_entry.grid(row=3, column=0, padx=10, pady=(0, 8), sticky='ew')
+        self.timeout_entry = num_entry('3000')
+        self.timeout_entry.grid(row=3, column=1, padx=10, pady=(0, 8), sticky='ew')
 
-        self.retry_failed_switch = ctk.CTkSwitch(
-            self.advanced_frame,
-            text='Retry failed once',
-            variable=self.retry_failed_var,
-            onvalue=True, offvalue=False
-        )
-        self.retry_failed_switch.grid(row=4, column=1, padx=10, pady=(4, 4), sticky='w')
+        # Remark override
+        field_label('Remark (optional)').grid(row=4, column=0, padx=10, pady=(6, 4), sticky='w')
+        self.remarker_entry = ctk.CTkEntry(
+            self.advanced_frame, textvariable=self.remarker_var, fg_color=CARD,
+            text_color=TEXT, border_color=BORDER, border_width=1, corner_radius=8)
+        self.remarker_entry.grid(row=5, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
 
-        self.site_check_switch = ctk.CTkSwitch(
-            self.advanced_frame,
-            text='Check site reachability',
-            variable=self.site_check_var,
-            onvalue=True, offvalue=False
-        )
-        self.site_check_switch.grid(row=5, column=0, padx=10, pady=(4, 10), sticky='w')
+        # Feature toggles
+        self.detect_country_switch = self._switch(self.advanced_frame, 'Detect exit country', self.detect_country_var)
+        self.detect_country_switch.grid(row=6, column=0, padx=10, pady=(4, 4), sticky='w')
 
-        self.dedupe_switch = ctk.CTkSwitch(
-            self.advanced_frame,
-            text='Remove duplicates',
-            variable=self.dedupe_var,
-            onvalue=True, offvalue=False
-        )
-        self.dedupe_switch.grid(row=5, column=1, padx=10, pady=(4, 10), sticky='w')
+        self.retry_failed_switch = self._switch(self.advanced_frame, 'Retry failed once', self.retry_failed_var)
+        self.retry_failed_switch.grid(row=6, column=1, padx=10, pady=(4, 4), sticky='w')
 
+        self.site_check_switch = self._switch(self.advanced_frame, 'Check site reachability', self.site_check_var)
+        self.site_check_switch.grid(row=7, column=0, padx=10, pady=(4, 10), sticky='w')
+
+        self.site_config_btn = ctk.CTkButton(
+            self.advanced_frame, text='Sites…', command=self.open_site_config,
+            width=80, height=28, corner_radius=PILL, fg_color=HOVER,
+            hover_color=HOVER_LIGHT, text_color=TEXT, font=self._font(12))
+        self.site_config_btn.grid(row=7, column=1, padx=10, pady=(4, 10), sticky='w')
+
+        self.dedupe_switch = self._switch(self.advanced_frame, 'Remove duplicates', self.dedupe_var)
+        self.dedupe_switch.grid(row=8, column=0, padx=10, pady=(4, 12), sticky='w')
+
+    # ---- Progress card ------------------------------------------------
     def _build_progress_card(self):
-        self.progress_frame = ctk.CTkFrame(self.main_frame)
+        self.progress_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
         self.progress_frame.grid(row=1, column=0, columnspan=2, pady=(0, 12), sticky='ew')
         self.progress_frame.grid_columnconfigure(0, weight=1)
 
-        self.status = ctk.CTkLabel(self.progress_frame, text='Ready', font=ctk.CTkFont(size=13, weight='bold'))
-        self.status.grid(row=0, column=0, padx=14, pady=(12, 4), sticky='w')
+        self.status = ctk.CTkLabel(self.progress_frame, text='Ready',
+                                   font=self._font(13, 'bold'), text_color=TEXT)
+        self.status.grid(row=0, column=0, padx=18, pady=(14, 6), sticky='w')
 
-        self.progress_bar = ctk.CTkProgressBar(self.progress_frame)
+        self.progress_bar = ctk.CTkProgressBar(
+            self.progress_frame, progress_color=ACCENT, fg_color=CARD2, height=8, corner_radius=4)
         self.progress_bar.set(0)
-        self.progress_bar.grid(row=1, column=0, padx=14, pady=(0, 12), sticky='ew')
+        self.progress_bar.grid(row=1, column=0, padx=18, pady=(0, 14), sticky='ew')
 
         self.controls_frame = ctk.CTkFrame(self.progress_frame, fg_color='transparent')
-        self.controls_frame.grid(row=2, column=0, padx=9, pady=(0, 12), sticky='ew')
+        self.controls_frame.grid(row=2, column=0, padx=13, pady=(0, 14), sticky='ew')
         self.controls_frame.grid_columnconfigure((0, 1, 2), weight=1)
 
         self.pause_button = ctk.CTkButton(
-            self.controls_frame,
-            text='Pause',
-            command=self.toggle_pause,
-            state='disabled',
-            fg_color='#b7791f',
-            hover_color='#975a16'
-        )
+            self.controls_frame, text='Pause', command=self.toggle_pause, state='disabled',
+            corner_radius=PILL, height=38, fg_color=WARN, hover_color=WARN_HOVER,
+            text_color='#000000', font=self._font(13, 'bold'))
         self.pause_button.grid(row=0, column=0, padx=5, sticky='ew')
 
         self.stop_save_button = ctk.CTkButton(
-            self.controls_frame,
-            text='Stop and save',
-            command=self.stop_and_save,
-            state='disabled',
-            fg_color='#2b6cb0',
-            hover_color='#2c5282'
-        )
+            self.controls_frame, text='Stop and save', command=self.stop_and_save, state='disabled',
+            corner_radius=PILL, height=38, fg_color=HOVER, hover_color=HOVER_LIGHT,
+            text_color=TEXT, font=self._font(13, 'bold'))
         self.stop_save_button.grid(row=0, column=1, padx=5, sticky='ew')
 
         self.stop_button = ctk.CTkButton(
-            self.controls_frame,
-            text='Stop',
-            command=self.stop_scan_now,
-            state='disabled',
-            fg_color='#c53030',
-            hover_color='#9b2c2c'
-        )
+            self.controls_frame, text='Stop', command=self.stop_scan_now, state='disabled',
+            corner_radius=PILL, height=38, fg_color=DANGER, hover_color=DANGER_HOVER,
+            text_color=TEXT, font=self._font(13, 'bold'))
         self.stop_button.grid(row=0, column=2, padx=5, sticky='ew')
 
+    # ---- Results card -------------------------------------------------
     def _build_results_card(self):
-        self.results_frame = ctk.CTkFrame(self.main_frame)
+        self.results_frame = ctk.CTkFrame(self.main_frame, fg_color=CARD, corner_radius=RADIUS)
         self.results_frame.grid(row=2, column=0, columnspan=2, sticky='ew')
         self.results_frame.grid_columnconfigure((0, 1, 2, 3), weight=1)
 
         stat_specs = [
-            ('fast_label', 'Fast', '#48bb78'),
-            ('medium_label', 'Medium', '#ecc94b'),
-            ('slow_label', 'Slow', '#9f7aea'),
-            ('dead_label', 'Dead', '#f56565'),
+            ('fast_label', 'Fast', ACCENT),
+            ('medium_label', 'Medium', WARN),
+            ('slow_label', 'Slow', SLOW),
+            ('dead_label', 'Dead', DANGER),
         ]
         for column, (attr, label, color) in enumerate(stat_specs):
-            stat = ctk.CTkLabel(
-                self.results_frame,
-                text=f'{label}: 0',
-                text_color=color,
-                font=ctk.CTkFont(size=14, weight='bold')
-            )
-            stat.grid(row=0, column=column, padx=12, pady=(12, 8), sticky='ew')
-            setattr(self, attr, stat)
+            tile = ctk.CTkFrame(self.results_frame, fg_color=CARD2, corner_radius=10)
+            tile.grid(row=0, column=column, padx=(14 if column == 0 else 6, 6 if column < 3 else 14),
+                      pady=(16, 10), sticky='ew')
+            tile.grid_columnconfigure(0, weight=1)
+            num = ctk.CTkLabel(tile, text='0', text_color=color, font=self._font(24, 'bold'))
+            num.grid(row=0, column=0, padx=10, pady=(10, 0))
+            cap = ctk.CTkLabel(tile, text=label, text_color=MUTED, font=self._font(12))
+            cap.grid(row=1, column=0, padx=10, pady=(0, 10))
+            setattr(self, attr, num)
 
-        self.copy_fast_btn = ctk.CTkButton(self.results_frame, text='Copy fast', command=self.copy_fast, state='disabled')
-        self.copy_fast_btn.grid(row=1, column=0, padx=(14, 5), pady=(0, 14), sticky='ew')
+        self.copy_fast_btn = self._copy_btn('Copy Fast', self.copy_fast)
+        self.copy_fast_btn.grid(row=1, column=0, padx=(14, 5), pady=(0, 16), sticky='ew')
 
-        self.copy_normal_btn = ctk.CTkButton(self.results_frame, text='Copy normal', command=self.copy_normal, state='disabled')
-        self.copy_normal_btn.grid(row=1, column=1, padx=5, pady=(0, 14), sticky='ew')
+        self.copy_medium_btn = self._copy_btn('Copy Medium', self.copy_medium)
+        self.copy_medium_btn.grid(row=1, column=1, padx=5, pady=(0, 16), sticky='ew')
 
-        self.copy_all_btn = ctk.CTkButton(self.results_frame, text='Copy active', command=self.copy_all_active, state='disabled')
-        self.copy_all_btn.grid(row=1, column=2, padx=5, pady=(0, 14), sticky='ew')
+        self.copy_slow_btn = self._copy_btn('Copy Slow', self.copy_slow)
+        self.copy_slow_btn.grid(row=1, column=2, padx=5, pady=(0, 16), sticky='ew')
 
-        self.export_button = ctk.CTkButton(
-            self.results_frame,
-            text='Export TXT',
-            command=self.export_active_links,
-            state='disabled',
-            fg_color='#3b4252',
-            hover_color='#4c566a'
-        )
-        self.export_button.grid(row=1, column=3, padx=(5, 14), pady=(0, 14), sticky='ew')
+        self.copy_all_btn = ctk.CTkButton(
+            self.results_frame, text='Copy All', command=self.copy_all, state='disabled',
+            corner_radius=PILL, height=38, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+            text_color='#000000', font=self._font(13, 'bold'))
+        self.copy_all_btn.grid(row=1, column=3, padx=(5, 14), pady=(0, 16), sticky='ew')
 
-    def _load_about_info(self):
-        """Read About.md and extract wallet addresses and social links."""
-        # Support running from source and from a PyInstaller bundle
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        base_dir = getattr(sys, '_MEIPASS', None) or script_dir
-        # try several candidate locations for About.md
-        candidates = [
-            os.path.join(base_dir, 'About.md'),
-            os.path.join(base_dir, '..', 'About.md'),
-            os.path.join(script_dir, '..', 'About.md'),
-        ]
-        about_path = None
-        for c in candidates:
-            c = os.path.abspath(c)
-            if os.path.exists(c):
-                about_path = c
-                break
-        info = {'wallets': {}, 'links': {}}
-        if not about_path:
-            return info
+    # ---- Styled-widget helpers ---------------------------------------
+    def _secondary_btn(self, parent, text, command):
+        return ctk.CTkButton(parent, text=text, command=command, corner_radius=PILL,
+                             height=36, fg_color=HOVER, hover_color=HOVER_LIGHT,
+                             text_color=TEXT, font=self._font(13, 'bold'))
 
-        with open(about_path, 'r', encoding='utf-8', errors='ignore') as f:
-            text = f.read()
+    def _danger_btn(self, parent, text, command):
+        return ctk.CTkButton(parent, text=text, command=command, corner_radius=PILL,
+                             height=36, fg_color=DANGER, hover_color=DANGER_HOVER,
+                             text_color=TEXT, font=self._font(13, 'bold'))
 
-        # find BTC and TRX addresses (simple key:value patterns)
-        for key in ('BTC', 'TRX'):
-            m = re.search(rf"{key}\s*[:\-]\s*([A-Za-z0-9]+)", text)
-            if m:
-                info['wallets'][key] = m.group(1).strip()
+    def _copy_btn(self, text, command):
+        return ctk.CTkButton(self.results_frame, text=text, command=command, state='disabled',
+                             corner_radius=PILL, height=38, fg_color=HOVER, hover_color=HOVER_LIGHT,
+                             text_color=TEXT, font=self._font(13, 'bold'))
 
-        # fallback: look for long alphanumeric addresses after labels
-        # extract any URLs
-        urls = re.findall(r'(https?://\S+)', text)
-        for u in urls:
-            if 't.me' in u:
-                info['links']['telegram'] = u
-            elif 'instagram' in u or 'instagr' in u:
-                info['links']['instagram'] = u
-            elif 'github' in u:
-                info['links']['github'] = u
+    def _switch(self, parent, text, variable):
+        return ctk.CTkSwitch(parent, text=text, variable=variable, onvalue=True, offvalue=False,
+                             progress_color=ACCENT, button_color=TEXT, button_hover_color=MUTED,
+                             text_color=TEXT, font=self._font(12))
 
-        # also try to find Telegram mentions like 'Telegram Chanel: https://t.me/...' or 'Telegram Group : https://t.me/...'
-        # If not found in urls, try simple regex patterns
-        if 'telegram' not in info['links']:
-            m = re.search(r'Telegram[^:\n]*[:\-]\s*(https?://t\.me/\S+)', text, re.IGNORECASE)
-            if m:
-                info['links']['telegram'] = m.group(1).strip()
-        if 'instagram' not in info['links']:
-            m = re.search(r'instagram[^:\n]*[:\-]\s*(https?://\S+)', text, re.IGNORECASE)
-            if m:
-                info['links']['instagram'] = m.group(1).strip()
-        if 'github' not in info['links']:
-            m = re.search(r'github[^:\n]*[:\-]\s*(https?://\S+)', text, re.IGNORECASE)
-            if m:
-                info['links']['github'] = m.group(1).strip()
+    # ------------------------------------------------------------------
+    # Site-check configuration popup
+    # ------------------------------------------------------------------
+    def open_site_config(self):
+        if self.site_popup is not None and self.site_popup.winfo_exists():
+            self.site_popup.focus()
+            return
 
-        return info
-
-    def open_donate_popup(self):
-        # Create a simple popup showing wallets and social links with copy/open actions
         popup = ctk.CTkToplevel(self)
-        popup.title('Donate')
-        popup.geometry('420x260')
+        popup.title('Site check')
+        popup.geometry('420x480')
+        popup.configure(fg_color=BG)
+        self.site_popup = popup
 
-        wallets = self.about_info.get('wallets', {})
-        links = self.about_info.get('links', {})
+        header = ctk.CTkLabel(popup, text='Sites to verify',
+                              font=self._font(16, 'bold'), text_color=TEXT)
+        header.pack(padx=18, pady=(16, 2), anchor='w')
+        ctk.CTkLabel(popup, text='Each selected site must be reachable through the proxy.',
+                     text_color=MUTED, font=self._font(12), wraplength=380,
+                     justify='left').pack(padx=18, pady=(0, 8), anchor='w')
 
-        row = 0
-        lbl = ctk.CTkLabel(popup, text='Support the project — donate any amount', font=ctk.CTkFont(size=14, weight='bold'))
-        lbl.grid(row=row, column=0, columnspan=3, padx=14, pady=(12, 8), sticky='w')
-        row += 1
+        self.site_list_frame = ctk.CTkScrollableFrame(popup, fg_color=CARD, corner_radius=RADIUS,
+                                                      height=220)
+        self.site_list_frame.pack(padx=18, pady=(0, 10), fill='both', expand=True)
+        self._populate_site_list()
 
-        if wallets:
-            for key, addr in wallets.items():
-                k_lbl = ctk.CTkLabel(popup, text=f'{key}:', width=60)
-                k_lbl.grid(row=row, column=0, padx=10, pady=6, sticky='w')
-                a_lbl = ctk.CTkLabel(popup, text=addr, text_color='#aab2bd')
-                a_lbl.grid(row=row, column=1, padx=6, pady=6, sticky='w')
-                copy_btn = ctk.CTkButton(popup, text='Copy', width=60, command=lambda a=addr: (self.clipboard_clear(), self.clipboard_append(a)))
-                copy_btn.grid(row=row, column=2, padx=10, pady=6)
-                row += 1
-        else:
-            no_lbl = ctk.CTkLabel(popup, text='No wallet info found in About.md', text_color='#aab2bd')
-            no_lbl.grid(row=row, column=0, columnspan=3, padx=14, pady=6, sticky='w')
-            row += 1
+        add_frame = ctk.CTkFrame(popup, fg_color='transparent')
+        add_frame.pack(padx=18, pady=(0, 8), fill='x')
+        add_frame.grid_columnconfigure(0, weight=1)
+        self.site_add_entry = ctk.CTkEntry(add_frame, placeholder_text='https://example.com',
+                                           fg_color=CARD2, text_color=TEXT, border_color=BORDER,
+                                           border_width=1, corner_radius=8)
+        self.site_add_entry.grid(row=0, column=0, padx=(0, 6), sticky='ew')
+        add_btn = ctk.CTkButton(add_frame, text='Add', width=70, command=self._add_custom_site,
+                                corner_radius=PILL, fg_color=ACCENT, hover_color=ACCENT_HOVER,
+                                text_color='#000000', font=self._font(12, 'bold'))
+        add_btn.grid(row=0, column=1)
 
-        # Social links
-        if links:
-            sep = ctk.CTkLabel(popup, text='')
-            sep.grid(row=row, column=0, pady=(6, 0))
-            row += 1
-            for name, url in links.items():
-                n_lbl = ctk.CTkLabel(popup, text=f'{name.capitalize()}:')
-                n_lbl.grid(row=row, column=0, padx=10, pady=4, sticky='w')
-                u_lbl = ctk.CTkLabel(popup, text=url, text_color='#63b3ed')
-                u_lbl.grid(row=row, column=1, padx=6, pady=4, sticky='w')
-                open_btn = ctk.CTkButton(popup, text='Open', width=60, command=lambda u=url: webbrowser.open(u))
-                open_btn.grid(row=row, column=2, padx=10, pady=4)
-                row += 1
+        strict = ctk.CTkCheckBox(popup, text='Strict (must reach all selected sites)',
+                                 variable=self.site_strict_var, onvalue=True, offvalue=False,
+                                 fg_color=ACCENT, hover_color=ACCENT_HOVER, checkmark_color='#000000',
+                                 border_color=MUTED, text_color=TEXT, font=self._font(12))
+        strict.pack(padx=18, pady=(4, 10), anchor='w')
 
-        close_btn = ctk.CTkButton(popup, text='Close', command=popup.destroy, fg_color='#3b4252')
-        close_btn.grid(row=row, column=0, columnspan=3, padx=14, pady=(12, 12), sticky='ew')
+        done_btn = ctk.CTkButton(popup, text='Done', command=popup.destroy,
+                                 corner_radius=PILL, height=40, fg_color=ACCENT,
+                                 hover_color=ACCENT_HOVER, text_color='#000000',
+                                 font=self._font(14, 'bold'))
+        done_btn.pack(padx=18, pady=(0, 16), fill='x')
 
+    def _populate_site_list(self):
+        for child in self.site_list_frame.winfo_children():
+            child.destroy()
+        for name in self.site_urls:
+            row = ctk.CTkFrame(self.site_list_frame, fg_color='transparent')
+            row.pack(fill='x', pady=3)
+            chk = ctk.CTkCheckBox(row, text=name, variable=self.site_vars[name],
+                                  onvalue=True, offvalue=False, fg_color=ACCENT,
+                                  hover_color=ACCENT_HOVER, checkmark_color='#000000',
+                                  border_color=MUTED, text_color=TEXT, font=self._font(13))
+            chk.pack(side='left', anchor='w')
+            ctk.CTkLabel(row, text=self.site_urls[name], text_color=MUTED,
+                         font=self._font(11)).pack(side='left', padx=(10, 0))
 
+    def _add_custom_site(self):
+        url = self.site_add_entry.get().strip()
+        if not url:
+            return
+        if not url.startswith(('http://', 'https://')):
+            url = 'https://' + url
+        # derive a readable name from the host
+        host = url.split('://', 1)[-1].split('/', 1)[0]
+        name = host or url
+        base = name
+        i = 2
+        while name in self.site_urls:
+            name = f'{base} ({i})'
+            i += 1
+        self.site_urls[name] = url
+        self.site_vars[name] = BooleanVar(value=True)
+        self.site_custom.append(name)
+        self.site_add_entry.delete(0, END)
+        self._populate_site_list()
+
+    def _build_site_targets(self):
+        return [(name, self.site_urls[name]) for name in self.site_urls
+                if self.site_vars[name].get()]
+
+    # ------------------------------------------------------------------
+    # Advanced settings toggle
+    # ------------------------------------------------------------------
     def toggle_advanced_settings(self):
         if self.advanced_visible:
             self.advanced_frame.grid_forget()
-            self.advanced_button.configure(text='Show advanced settings')
+            self.advanced_button.configure(text='Advanced settings')
         else:
-            self.advanced_frame.grid(row=8, column=0, padx=14, pady=(0, 14), sticky='ew')
-            self.advanced_button.configure(text='Hide advanced settings')
+            self.advanced_frame.grid(row=8, column=0, padx=18, pady=(0, 16), sticky='ew')
+            self.advanced_button.configure(text='Hide settings')
         self.advanced_visible = not self.advanced_visible
 
+    # ------------------------------------------------------------------
+    # Thread-safe logging / UI marshaling
+    # ------------------------------------------------------------------
     def log(self, text):
         with self.log_lock:
             self.log_queue.append(text)
@@ -552,17 +582,18 @@ class ConfigScannerApp(ctk.CTk):
     def set_copy_buttons(self, state):
         self.after(0, lambda: [
             button.configure(state=state)
-            for button in (self.copy_fast_btn, self.copy_normal_btn, self.copy_all_btn, self.export_button)
+            for button in (self.copy_fast_btn, self.copy_medium_btn,
+                           self.copy_slow_btn, self.copy_all_btn)
         ])
 
     def update_live_stats(self, fast, medium, slow, dead):
         self.after(0, lambda: self._update_live_stats(fast, medium, slow, dead))
 
     def _update_live_stats(self, fast, medium, slow, dead):
-        self.fast_label.configure(text=f'Fast: {fast}')
-        self.medium_label.configure(text=f'Medium: {medium}')
-        self.slow_label.configure(text=f'Slow: {slow}')
-        self.dead_label.configure(text=f'Dead: {dead}')
+        self.fast_label.configure(text=str(fast))
+        self.medium_label.configure(text=str(medium))
+        self.slow_label.configure(text=str(slow))
+        self.dead_label.configure(text=str(dead))
 
     def update_link_count(self):
         # Update total loaded count
@@ -658,11 +689,6 @@ class ConfigScannerApp(ctk.CTk):
             except Exception:
                 proto = None
 
-            # Skip unsupported/excluded protocols like hysteria
-            if proto in ('hysteria', 'hysteria2'):
-                self.log(f'Skipped unsupported protocol: {proto} for {link}')
-                continue
-
             if link not in self.loaded_links:
                 self.loaded_links.add(link)
                 added_links += 1
@@ -728,19 +754,22 @@ class ConfigScannerApp(ctk.CTk):
             display_path = self.folder_path
             if len(display_path) > 54:
                 display_path = '...' + display_path[-51:]
-            self.folder_label.configure(text=display_path)
+            self.folder_label.configure(text=display_path, text_color=TEXT)
             self.set_status(f'Output folder selected: {self.folder_path}')
             self.update_link_count()
 
+    # ------------------------------------------------------------------
+    # Pause / stop control
+    # ------------------------------------------------------------------
     def toggle_pause(self):
         if self.scan_state == 'running':
             self.scan_state = 'paused'
-            self.pause_button.configure(text='Resume', fg_color='#38a169', hover_color='#2f855a')
+            self.pause_button.configure(text='Resume', fg_color=ACCENT, hover_color=ACCENT_HOVER)
             self.log('Scan paused.')
             self.set_status('Scan paused')
         elif self.scan_state == 'paused':
             self.scan_state = 'running'
-            self.pause_button.configure(text='Pause', fg_color='#b7791f', hover_color='#975a16')
+            self.pause_button.configure(text='Pause', fg_color=WARN, hover_color=WARN_HOVER)
             self.log('Scan resumed.')
             self.set_status('Scan resumed')
             with self.pause_cond:
@@ -789,6 +818,9 @@ class ConfigScannerApp(ctk.CTk):
             'sites_ok': []
         }
 
+    # ------------------------------------------------------------------
+    # Scan orchestration
+    # ------------------------------------------------------------------
     def start_scan(self):
         filtered_links = self._filtered_loaded_links()
         if not filtered_links:
@@ -818,21 +850,38 @@ class ConfigScannerApp(ctk.CTk):
         self.set_scan_buttons('disabled')
         self.set_copy_buttons('disabled')
         self.fast_links = []
-        self.normal_links = []
-        self.active_links = []
+        self.medium_links = []
+        self.slow_links = []
+        self.active = []
         self.update_live_stats(0, 0, 0, 0)
         self.scan_state = 'running'
-        self.pause_button.configure(text='Pause', fg_color='#b7791f', hover_color='#975a16')
+        self.pause_button.configure(text='Pause', fg_color=WARN, hover_color=WARN_HOVER)
         self.set_control_buttons('normal', 'normal', 'normal')
 
-        # Read GUI inputs on main thread to avoid tkinter access from worker threads
+        # Read GUI inputs on the MAIN thread (Tk access is not thread-safe).
         try:
-            max_workers = int(self.threads_entry.get().strip())
-            if max_workers <= 0:
+            precheck_workers = int(self.precheck_entry.get().strip())
+            if precheck_workers <= 0:
                 raise ValueError
         except Exception:
-            max_workers = 40
-            self.log('Invalid thread count. Using 40.')
+            precheck_workers = 200
+            self.log('Invalid precheck workers. Using 200.')
+
+        try:
+            test_workers = int(self.test_entry.get().strip())
+            if test_workers <= 0:
+                raise ValueError
+        except Exception:
+            test_workers = 16
+            self.log('Invalid test workers. Using 16.')
+
+        try:
+            speed_limit = int(self.speed_entry.get().strip())
+            if speed_limit <= 0:
+                raise ValueError
+        except Exception:
+            speed_limit = 6
+            self.log('Invalid speed-test slots. Using 6.')
 
         try:
             timeout_ms = float(self.timeout_entry.get().strip())
@@ -843,21 +892,18 @@ class ConfigScannerApp(ctk.CTk):
             timeout = 3.0
             self.log('Invalid timeout. Using 3000ms.')
 
-        # Read the Remark override on the main thread (Tk access is not thread-safe)
         try:
             remark_override = self.remarker_var.get().strip()
         except Exception as e:
             remark_override = ''
             self.log(f'Error reading Remark field: {e}')
 
-        # Read the Ultra Scan flag on the main thread (Tk access is not thread-safe)
         try:
             ultra_scan = bool(self.ultra_scan_var.get())
         except Exception as e:
             ultra_scan = False
             self.log(f'Error reading Ultra Scan flag: {e}')
 
-        # Read the four feature toggles on the main thread (Tk access is not thread-safe)
         try:
             detect_country = bool(self.detect_country_var.get())
         except Exception as e:
@@ -879,41 +925,57 @@ class ConfigScannerApp(ctk.CTk):
             dedupe = True
             self.log(f'Error reading Remove duplicates flag: {e}')
 
+        # Build site-check targets on the main thread
+        if site_check:
+            try:
+                site_targets = self._build_site_targets()
+            except Exception as e:
+                site_targets = []
+                self.log(f'Error reading site targets: {e}')
+            try:
+                site_strict = bool(self.site_strict_var.get())
+            except Exception:
+                site_strict = True
+            if not site_targets:
+                self.log('Site check enabled but no sites selected; disabling site check.')
+                site_check = False
+                site_strict = False
+        else:
+            site_targets = []
+            site_strict = False
+
         threading.Thread(
             target=self.run_scan,
-            args=(methods, filtered_links, max_workers, timeout),
+            args=(methods, filtered_links),
             kwargs={
+                'precheck_workers': precheck_workers,
+                'test_workers': test_workers,
+                'speed_limit': speed_limit,
+                'timeout': timeout,
                 'remark_override': remark_override,
                 'ultra': ultra_scan,
                 'detect_country': detect_country,
                 'retry_failed': retry_failed,
                 'site_check': site_check,
                 'dedupe': dedupe,
+                'site_targets': site_targets,
+                'site_strict': site_strict,
             },
             daemon=True
         ).start()
 
-    def run_scan(self, methods, filtered_links, max_workers=None, timeout=3.0, remark_override=None, ultra=False,
-                 detect_country=True, retry_failed=False, site_check=False, dedupe=True):
+    def run_scan(self, methods, filtered_links, *, precheck_workers, test_workers, speed_limit,
+                 timeout, remark_override, ultra, detect_country, retry_failed, site_check,
+                 dedupe, site_targets, site_strict):
         try:
-            # Ensure defaults if not provided
-            if not max_workers:
-                max_workers = 40
-            if not timeout:
-                timeout = 3.0
-
             # Reset any prior abort flag before starting fresh work
             self.scanner.reset_abort()
 
             # Configure scanner-driven features for this run
             self.scanner.detect_country = detect_country
             self.scanner.site_check = site_check
-            self.scanner.site_targets = [
-                ('youtube', 'https://www.youtube.com'),
-                ('instagram', 'https://www.instagram.com'),
-                ('telegram', 'https://web.telegram.org'),
-                ('chatgpt', 'https://chatgpt.com'),
-            ] if site_check else []
+            self.scanner.site_strict = site_strict
+            self.scanner.site_targets = list(site_targets) if site_check else []
 
             if methods and not os.path.exists(self.scanner.xray_path):
                 self.log('xray.exe not found in Core/xray folder.')
@@ -931,13 +993,12 @@ class ConfigScannerApp(ctk.CTk):
             total_links = len(unique_links)
             self.log(f'Processing {total_links} unique configs.')
             selected_method = 'xray' if 'xray' in methods else 'fast'
-            precheck_workers = min(max_workers * 4, 200)
+
+            # Ultra scan boosts real-test throughput.
             if ultra:
-                test_workers = min(max_workers, 100)
-                speed_limit = min(test_workers, 24)
-            else:
-                test_workers = min(max_workers, 16)
-                speed_limit = min(test_workers, 6)
+                test_workers = max(test_workers, 100)
+                speed_limit = max(speed_limit, 24)
+
             self.scanner.set_speed_test_limit(speed_limit)
             self.log(
                 f'Pipeline: precheck workers={precheck_workers}, test workers={test_workers}, '
@@ -946,16 +1007,12 @@ class ConfigScannerApp(ctk.CTk):
             )
 
             results = []
-            pre_done = 0
             reachable = 0
             test_done = 0
             fast_count = 0
             medium_count = 0
             slow_count = 0
             dead_count = 0
-            active_links = set()
-            fast_links_set = set()
-            normal_links_set = set()
             last_pct = 0.0
 
             def show_progress(pct):
@@ -975,8 +1032,7 @@ class ConfigScannerApp(ctk.CTk):
                 self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
 
             def report_precheck(pd, total, reach):
-                nonlocal pre_done, reachable
-                pre_done = pd
+                nonlocal reachable
                 reachable = reach
                 pct = (pd / total) * 0.15 if total else 0
                 show_progress(pct)
@@ -988,20 +1044,15 @@ class ConfigScannerApp(ctk.CTk):
                 reachable = reach
                 if result:
                     results.append(result)
-                    link = item.get('link', '') if item else result.get('link', '')
                     classification = result.get('classification', 'dead')
                     if classification == 'fast':
                         fast_count += 1
-                        fast_links_set.add(link)
                     elif classification == 'medium':
                         medium_count += 1
-                        normal_links_set.add(link)
                     elif classification == 'slow':
                         slow_count += 1
-                        normal_links_set.add(link)
                     else:
                         dead_count += 1
-                    active_links.add(link)
                 pct = 0.15 + (td / max(reach, 1)) * 0.85
                 show_progress(pct)
                 self.set_status(f'Tested {td}/{max(reach, 1)} reachable configs')
@@ -1030,27 +1081,22 @@ class ConfigScannerApp(ctk.CTk):
                 self.log(f'Testing complete: {test_done}/{max(reachable, 1)} reachable configs tested.')
 
             if self.scan_state != 'stopping':
-                self.fast_links = sorted(fast_links_set)
-                self.normal_links = sorted(normal_links_set)
-                self.active_links = sorted(active_links)
-                
-                # Apply Remark override if provided before saving
-                rem = (remark_override or '').strip()
+                # Rename each result's remark + link fragment, then derive the copy
+                # lists from the (renamed) results grouped by classification.
+                naming.apply_naming(results, remark_override, detect_country)
+                self.fast_links = [r['link'] for r in results if r.get('classification') == 'fast']
+                self.medium_links = [r['link'] for r in results if r.get('classification') == 'medium']
+                self.slow_links = [r['link'] for r in results if r.get('classification') == 'slow']
+                self.active = self.fast_links + self.medium_links + self.slow_links
 
-                if not rem:
-                    self.log('No Remark override provided. Using original remarks.')
-                else:
-                    self.log(f'Applying Remark override: "{rem}" to all {len(results)} results.')
-                    if results:
-                        for item in results:
-                            item['remark'] = rem
-                    else:
-                        self.log('No results to apply Remark override to.')
-                
                 self.save_results(results)
                 self.log('')
                 self.log('Scan complete.')
-                self.log(f'Working configs: {len(active_links)} (fast: {len(fast_links_set)}, normal: {len(normal_links_set)}).')
+                self.log(
+                    f'Working configs: {len(self.active)} '
+                    f'(fast: {len(self.fast_links)}, medium: {len(self.medium_links)}, '
+                    f'slow: {len(self.slow_links)}).'
+                )
                 self.set_status('Scan completed successfully')
             else:
                 self.set_status('Scan aborted')
@@ -1059,7 +1105,8 @@ class ConfigScannerApp(ctk.CTk):
             self.set_status('Scan failed')
         finally:
             self.set_scan_buttons('normal' if self.loaded_links and self.folder_path else 'disabled')
-            self.set_copy_buttons('normal' if self.fast_links or self.normal_links else 'disabled')
+            has_links = bool(self.fast_links or self.medium_links or self.slow_links)
+            self.set_copy_buttons('normal' if has_links else 'disabled')
             self.set_control_buttons('disabled', 'disabled', 'disabled')
             self.scan_state = 'idle'
 
@@ -1135,55 +1182,32 @@ class ConfigScannerApp(ctk.CTk):
                     f.write(line + '\n')
             self.log(f'Saved {file_base}')
 
-    def export_active_links(self):
-        active = sorted(set(self.fast_links + self.normal_links))
-        if not active:
-            self.log('No active configs are available to export.')
-            return
-        
-        # Ask user for export file location
-        file_path = filedialog.asksaveasfilename(
-            defaultextension='.txt',
-            filetypes=[('Text files', '*.txt'), ('All files', '*.*')],
-            initialfile='active_configs.txt'
-        )
-        
-        if not file_path:
-            self.log('Export cancelled.')
-            return
-        
-        try:
-            with open(file_path, 'w', encoding='utf-8') as f:
-                # Export only the links (standard format for Xray configs)
-                f.write('\n'.join(active))
-            self.log(f'Exported {len(active)} active configs to {os.path.basename(file_path)}.')
-        except Exception as e:
-            self.log(f'Error exporting configs: {e}')
+    # ------------------------------------------------------------------
+    # Clipboard exports
+    # ------------------------------------------------------------------
+    def _copy_links(self, links, label):
+        if links:
+            self.clipboard_clear()
+            self.clipboard_append('\n'.join(links))
+            self.update()
+            self.log(f'{label} configs copied.')
+        else:
+            self.log(f'No {label.lower()} configs are available to copy.')
 
     def copy_fast(self):
-        if self.fast_links:
-            self.clipboard_clear()
-            self.clipboard_append('\n'.join(self.fast_links))
-            self.update()
-            self.log('Fast configs copied.')
-        else:
-            self.log('No fast configs are available to copy.')
+        self._copy_links(self.fast_links, 'Fast')
 
-    def copy_normal(self):
-        if self.normal_links:
-            self.clipboard_clear()
-            self.clipboard_append('\n'.join(self.normal_links))
-            self.update()
-            self.log('Normal configs copied.')
-        else:
-            self.log('No normal configs are available to copy.')
+    def copy_medium(self):
+        self._copy_links(self.medium_links, 'Medium')
 
-    def copy_all_active(self):
-        all_links = sorted(set(self.fast_links + self.normal_links))
-        if all_links:
-            self.clipboard_clear()
-            self.clipboard_append('\n'.join(all_links))
-            self.update()
-            self.log('All active configs copied.')
-        else:
-            self.log('No active configs are available to copy.')
+    def copy_slow(self):
+        self._copy_links(self.slow_links, 'Slow')
+
+    def copy_all(self):
+        seen = set()
+        out = []
+        for link in self.fast_links + self.medium_links + self.slow_links:
+            if link not in seen:
+                seen.add(link)
+                out.append(link)
+        self._copy_links(out, 'All')

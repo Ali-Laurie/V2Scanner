@@ -17,8 +17,8 @@ def _is_ip_literal(value):
     except ValueError:
         return False
 
-SUPPORTED_PROTOCOLS = ('vmess', 'vless', 'trojan', 'ss', 'hysteria', 'hysteria2', 'socks', 'http')
-LINK_RE = re.compile(r'(vmess://[^\s\'\"]+|vless://[^\s\'\"]+|trojan://[^\s\'\"]+|ss://[^\s\'\"]+|hysteria2?://[^\s\'\"]+|socks://[^\s\'\"]+|http://[^\s\'\"]+)')
+SUPPORTED_PROTOCOLS = ('vmess', 'vless', 'trojan', 'ss', 'hysteria', 'hysteria2', 'tuic', 'anytls', 'wireguard', 'socks', 'http')
+LINK_RE = re.compile(r'(vmess://[^\s\'\"]+|vless://[^\s\'\"]+|trojan://[^\s\'\"]+|ss://[^\s\'\"]+|hysteria2://[^\s\'\"]+|hy2://[^\s\'\"]+|hysteria://[^\s\'\"]+|tuic://[^\s\'\"]+|anytls://[^\s\'\"]+|wireguard://[^\s\'\"]+|socks://[^\s\'\"]+|http://[^\s\'\"]+)')
 UUID_RE = re.compile(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$')
 SUPPORTED_SS_METHODS = {
     'aes-128-gcm', 'aes-192-gcm', 'aes-256-gcm',
@@ -26,6 +26,14 @@ SUPPORTED_SS_METHODS = {
     'aes-128-cfb', 'aes-192-cfb', 'aes-256-cfb',
     'des-cfb', 'rc4-md5', 'rc4', 'aes-128-ctr',
 }
+
+
+def _qget(q, *keys):
+    for k in keys:
+        vals = q.get(k)
+        if vals and vals[0]:
+            return vals[0]
+    return ''
 
 
 def try_decode_base64_content(content):
@@ -182,6 +190,8 @@ def parse_generic(link):
         remark = unquote(link.split('#')[-1]) if '#' in link else ''
         p = urlparse(main_part)
         proto = p.scheme.lower()
+        if proto == 'hy2':
+            proto = 'hysteria2'
         if proto not in SUPPORTED_PROTOCOLS:
             return None
 
@@ -258,11 +268,27 @@ def parse_generic(link):
                         credentials = ''
                 else:
                     credentials = ''
+        elif proto == 'hysteria2':
+            if p.password is not None:
+                credentials = '{}:{}'.format(unquote(p.username or ''), unquote(p.password or ''))
+            else:
+                credentials = unquote(p.username or '')
+        elif proto == 'hysteria':
+            credentials = unquote(p.username or '') or (unquote(p.password or '') if p.password is not None else '')
+        elif proto == 'tuic':
+            uuid_val = unquote(p.username or '')
+            pw_val = unquote(p.password or '') if p.password is not None else ''
+            credentials = pw_val or uuid_val
+        elif proto == 'anytls':
+            if p.password is not None:
+                credentials = '{}:{}'.format(unquote(p.username or ''), unquote(p.password or ''))
+            else:
+                credentials = unquote(p.username or '')
+        elif proto == 'wireguard':
+            credentials = unquote(p.username or '')
         else:
             credentials = unquote(p.username or '')
             if proto == 'trojan' and not credentials:
-                credentials = unquote(p.password or '')
-            if proto in ('hysteria', 'hysteria2') and not credentials:
                 credentials = unquote(p.password or '')
 
         if port is not None:
@@ -274,7 +300,7 @@ def parse_generic(link):
             security_mode = 'tls'
         if security_mode == '' and proto in ('vless', 'trojan') and port == 443:
             security_mode = 'tls'
-        if security_mode == '' and proto in ('hysteria', 'hysteria2'):
+        if security_mode == '' and proto in ('hysteria', 'hysteria2', 'tuic', 'anytls'):
             security_mode = 'tls'
 
         is_tls = security_mode in ('tls', 'xtls')
@@ -309,6 +335,14 @@ def parse_generic(link):
         short_id = q.get('sid', [''])[0]
         spider_x = q.get('spx', [''])[0]
         plugin = q.get('plugin', [''])[0]
+        obfs_password = _qget(q, 'obfs-password', 'obfs_password', 'obfsParam')
+        congestion_control = _qget(q, 'congestion_control', 'congestion', 'congestion-control')
+        udp_relay_mode = _qget(q, 'udp_relay_mode', 'udp-relay-mode')
+        up_mbps = _qget(q, 'upmbps', 'up_mbps', 'up-mbps')
+        down_mbps = _qget(q, 'downmbps', 'down_mbps', 'down-mbps')
+
+        if proto == 'hysteria' and not credentials:
+            credentials = auth
 
         extra = {
             'alpn': alpn,
@@ -331,6 +365,46 @@ def parse_generic(link):
             'plugin': plugin,
         }
         extra = {k: v for k, v in extra.items() if v}
+
+        if proto == 'hysteria2':
+            if credentials:
+                extra['password'] = credentials
+                extra['auth'] = credentials
+            if obfs_password:
+                extra['obfs_password'] = obfs_password
+        elif proto == 'hysteria':
+            if credentials or auth:
+                extra['auth'] = credentials or auth
+            if up_mbps:
+                extra['up_mbps'] = up_mbps
+            if down_mbps:
+                extra['down_mbps'] = down_mbps
+        elif proto == 'tuic':
+            uuid_val = unquote(p.username or '')
+            pw_val = unquote(p.password or '') if p.password is not None else ''
+            if uuid_val:
+                extra['uuid'] = uuid_val
+            if pw_val:
+                extra['password'] = pw_val
+            if congestion_control:
+                extra['congestion_control'] = congestion_control
+            if udp_relay_mode:
+                extra['udp_relay_mode'] = udp_relay_mode
+        elif proto == 'anytls':
+            if credentials:
+                extra['password'] = credentials
+        elif proto == 'wireguard':
+            pk = credentials or _qget(q, 'privateKey', 'private_key', 'pk', 'secret')
+            peer = _qget(q, 'publickey', 'public_key', 'peer_public_key', 'peerPublicKey', 'pubkey', 'peer')
+            addr = _qget(q, 'address', 'addresses', 'ip')
+            if pk:
+                extra['private_key'] = pk
+            if peer:
+                extra['peer_public_key'] = peer
+            if addr:
+                extra['address'] = addr
+            if not pk and not peer:
+                return None
 
         sni = q.get('sni', [''])[0] or host_header or ('' if _is_ip_literal(host) else host)
 
@@ -388,6 +462,19 @@ def validate_parsed_config(parsed):
             return False, 'Missing hysteria password/auth'
         if parsed.get('transport_type') not in ('tcp', 'udp', 'ws'):
             return False, 'Unsupported hysteria transport type'
+    elif proto == 'tuic':
+        extra = parsed.get('extra') or {}
+        if not extra.get('uuid'):
+            return False, 'Missing tuic uuid'
+        if not credentials:
+            return False, 'Missing tuic password'
+    elif proto == 'anytls':
+        if not credentials:
+            return False, 'Missing anytls password'
+    elif proto == 'wireguard':
+        extra = parsed.get('extra') or {}
+        if not extra.get('private_key') and not extra.get('peer_public_key'):
+            return False, 'Missing wireguard key material'
 
     if parsed.get('security_mode') == 'xtls' and proto not in ('vless',):
         return False, 'XTLS is only supported for VLESS in this parser'
