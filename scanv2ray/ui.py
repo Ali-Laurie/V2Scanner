@@ -111,6 +111,10 @@ class ConfigScannerApp(ctk.CTk):
         self._donut_counts = (0, 0, 0, 0)
         self._progress_samples = []
         self._scan_t0 = None
+        # Coalesce chart redraws so live updates / resize storms never flood
+        # the Tk main loop (was causing UI + system lag).
+        self._donut_pending = False
+        self._spark_pending = False
 
         if getattr(sys, 'frozen', False):
             base_dir = sys._MEIPASS
@@ -372,14 +376,12 @@ class ConfigScannerApp(ctk.CTk):
         self.start_button = ctk.CTkButton(
             self.setup_frame, text='Start scan', command=self.start_scan, state='disabled',
             height=44, corner_radius=BTN_R, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            text_color=WHITE, font=self._font(15, 'bold'))
+            text_color=WHITE, text_color_disabled='#C8CED8', font=self._font(15, 'bold'))
         self.start_button.grid(row=6, column=0, padx=20, pady=(0, 10), sticky='ew')
 
-        self.advanced_button = self._secondary_btn(
-            self.setup_frame, 'Advanced settings', self.toggle_advanced_settings)
-        self.advanced_button.grid(row=7, column=0, padx=20, pady=(0, 12), sticky='ew')
-
+        # Advanced settings are always visible (no show/hide toggle).
         self._build_advanced_frame()
+        self.advanced_frame.grid(row=7, column=0, padx=20, pady=(0, 14), sticky='ew')
 
     def _build_advanced_frame(self):
         self.advanced_frame = ctk.CTkFrame(self.setup_frame, fg_color=SURFACE2, corner_radius=INNER_R,
@@ -422,25 +424,25 @@ class ConfigScannerApp(ctk.CTk):
         self.remarker_entry.grid(row=5, column=0, columnspan=2, padx=10, pady=(0, 10), sticky='ew')
         self._focusable(self.remarker_entry)
 
-        # Feature toggles
+        # Feature toggles — single column so labels never clip in the narrow card
         self.detect_country_switch = self._switch(self.advanced_frame, 'Detect exit country', self.detect_country_var)
-        self.detect_country_switch.grid(row=6, column=0, padx=10, pady=(4, 4), sticky='w')
+        self.detect_country_switch.grid(row=6, column=0, columnspan=2, padx=10, pady=(4, 4), sticky='w')
 
         self.retry_failed_switch = self._switch(self.advanced_frame, 'Retry failed once', self.retry_failed_var)
-        self.retry_failed_switch.grid(row=6, column=1, padx=10, pady=(4, 4), sticky='w')
-
-        self.site_check_switch = self._switch(self.advanced_frame, 'Check site reachability', self.site_check_var)
-        self.site_check_switch.grid(row=7, column=0, padx=10, pady=(4, 10), sticky='w')
-
-        self.site_config_btn = ctk.CTkButton(
-            self.advanced_frame, text='Sites…', command=self.open_site_config,
-            width=80, height=28, corner_radius=BTN_R, fg_color=BG,
-            border_width=1, border_color=LINE, hover_color=ELEV,
-            text_color=TEXT, font=self._font(12))
-        self.site_config_btn.grid(row=7, column=1, padx=10, pady=(4, 10), sticky='w')
+        self.retry_failed_switch.grid(row=7, column=0, columnspan=2, padx=10, pady=(4, 4), sticky='w')
 
         self.dedupe_switch = self._switch(self.advanced_frame, 'Remove duplicates', self.dedupe_var)
-        self.dedupe_switch.grid(row=8, column=0, padx=10, pady=(4, 12), sticky='w')
+        self.dedupe_switch.grid(row=8, column=0, columnspan=2, padx=10, pady=(4, 4), sticky='w')
+
+        self.site_check_switch = self._switch(self.advanced_frame, 'Check site reachability', self.site_check_var)
+        self.site_check_switch.grid(row=9, column=0, columnspan=2, padx=10, pady=(4, 4), sticky='w')
+
+        self.site_config_btn = ctk.CTkButton(
+            self.advanced_frame, text='Configure sites…', command=self.open_site_config,
+            width=140, height=28, corner_radius=BTN_R, fg_color=BG,
+            border_width=1, border_color=LINE, hover_color=ELEV,
+            text_color=TEXT, font=self._font(12))
+        self.site_config_btn.grid(row=10, column=0, columnspan=2, padx=10, pady=(2, 12), sticky='w')
 
     # ---- Progress card ------------------------------------------------
     def _build_progress_card(self):
@@ -475,19 +477,21 @@ class ConfigScannerApp(ctk.CTk):
         self.pause_button = ctk.CTkButton(
             self.controls_frame, text='Pause', command=self.toggle_pause, state='disabled',
             corner_radius=BTN_R, height=40, fg_color=ACCENT, hover_color=ACCENT_HOVER,
-            text_color=WHITE, font=self._font(13, 'bold'))
+            text_color=WHITE, text_color_disabled='#C8CED8', font=self._font(13, 'bold'))
         self.pause_button.grid(row=0, column=0, padx=5, sticky='ew')
 
         self.stop_save_button = ctk.CTkButton(
             self.controls_frame, text='Stop and save', command=self.stop_and_save, state='disabled',
             corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
-            border_color=LINE, hover_color=ELEV, text_color=TEXT, font=self._font(13, 'bold'))
+            border_color=LINE, hover_color=ELEV, text_color=TEXT,
+            text_color_disabled='#C8CED8', font=self._font(13, 'bold'))
         self.stop_save_button.grid(row=0, column=1, padx=5, sticky='ew')
 
         self.stop_button = ctk.CTkButton(
             self.controls_frame, text='Stop', command=self.stop_scan_now, state='disabled',
             corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
-            border_color=DEAD_DIM, hover_color=ELEV, text_color=DEAD, font=self._font(13, 'bold'))
+            border_color=DEAD_DIM, hover_color=ELEV, text_color=DEAD,
+            text_color_disabled='#C8CED8', font=self._font(13, 'bold'))
         self.stop_button.grid(row=0, column=2, padx=5, sticky='ew')
 
         self._draw_sparkline()
@@ -581,8 +585,8 @@ class ConfigScannerApp(ctk.CTk):
     def _copy_btn(self, parent, text, command):
         return ctk.CTkButton(parent, text=text, command=command, state='disabled',
                              corner_radius=BTN_R, height=40, fg_color=SURFACE2, border_width=1,
-                             border_color=LINE, hover_color=ELEV,
-                             text_color=TEXT, font=self._font(13, 'bold'))
+                             border_color=LINE, hover_color=ELEV, text_color=TEXT,
+                             text_color_disabled='#C8CED8', font=self._font(13, 'bold'))
 
     def _switch(self, parent, text, variable):
         return ctk.CTkSwitch(parent, text=text, variable=variable, onvalue=True, offvalue=False,
@@ -602,6 +606,15 @@ class ConfigScannerApp(ctk.CTk):
     # Live graphics — donut chart + progress sparkline
     # ------------------------------------------------------------------
     def _draw_donut(self, event=None):
+        # Throttle: coalesce bursts of redraws (live stats + <Configure>) to
+        # at most one render per ~150 ms so the main loop never gets flooded.
+        if self._donut_pending:
+            return
+        self._donut_pending = True
+        self.after(150, self._render_donut)
+
+    def _render_donut(self):
+        self._donut_pending = False
         c = getattr(self, 'donut_canvas', None)
         if c is None:
             return
@@ -673,6 +686,13 @@ class ConfigScannerApp(ctk.CTk):
                           font=('Courier New', 12, 'bold'))
 
     def _draw_sparkline(self, event=None):
+        if self._spark_pending:
+            return
+        self._spark_pending = True
+        self.after(150, self._render_sparkline)
+
+    def _render_sparkline(self):
+        self._spark_pending = False
         c = getattr(self, 'spark_canvas', None)
         if c is None:
             return
@@ -817,17 +837,6 @@ class ConfigScannerApp(ctk.CTk):
         return [(name, self.site_urls[name]) for name in self.site_urls
                 if self.site_vars[name].get()]
 
-    # ------------------------------------------------------------------
-    # Advanced settings toggle
-    # ------------------------------------------------------------------
-    def toggle_advanced_settings(self):
-        if self.advanced_visible:
-            self.advanced_frame.grid_forget()
-            self.advanced_button.configure(text='Advanced settings')
-        else:
-            self.advanced_frame.grid(row=8, column=0, padx=18, pady=(0, 16), sticky='ew')
-            self.advanced_button.configure(text='Hide settings')
-        self.advanced_visible = not self.advanced_visible
 
     # ------------------------------------------------------------------
     # Thread-safe logging / UI marshaling
