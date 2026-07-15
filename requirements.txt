@@ -1,1 +1,1 @@
-customtkinter
+PySide6

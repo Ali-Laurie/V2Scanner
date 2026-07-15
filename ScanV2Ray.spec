@@ -1,8 +1,10 @@
 # -*- mode: python ; coding: utf-8 -*-
-
+# ScanV2Ray — PySide6 (Qt) UI, one-file build.
+# Entry: Scan_qt.py -> scanv2ray.main_qt -> scanv2ray.ui_qt (PySide6).
+# PyInstaller's bundled PySide6 hook auto-collects the Qt libraries/plugins.
 
 a = Analysis(
-    ['Scan.py'],
+    ['Scan_qt.py'],
     pathex=[],
     binaries=[],
     datas=[('About.md', '.'), ('scanv2ray', 'scanv2ray'), ('Core', 'Core')],
@@ -10,7 +12,8 @@ a = Analysis(
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=[],
+    # Legacy tkinter UI is no longer built; other Qt bindings would clash.
+    excludes=['tkinter', 'customtkinter', 'PyQt5', 'PyQt6', 'PySide2'],
     noarchive=False,
     optimize=0,
 )
@@ -26,7 +29,8 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    # UPX can corrupt Qt6 DLLs and yield an exe that won't launch -> keep it off.
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,

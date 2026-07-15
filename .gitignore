@@ -48,3 +48,6 @@ scan_out.txt
 *.tmp
 *.bak
 *.backup
+
+# Qt dev venv
+.venv-qt/
