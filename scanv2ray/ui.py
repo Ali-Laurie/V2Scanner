@@ -1348,14 +1348,16 @@ class ConfigScannerApp(ctk.CTk):
                 batches.append(unique_links[_off:_off + _sz])
                 _off += _sz
             if num_chunks > 1:
-                # Gentler phase 1 on huge inputs: fewer concurrent TCP probes and
-                # a more patient timeout so slow-connecting configs are not missed.
-                precheck_workers = min(precheck_workers, 100)
-                self.scanner.precheck_timeout = 1.2
+                # Batching already bounds the load, so phase 1 keeps most of its
+                # parallelism. Only a light governor against pathological worker
+                # counts, plus a small timeout bump over the 0.7s default so
+                # slow-connecting configs aren't missed.
+                precheck_workers = min(precheck_workers, 250)
+                self.scanner.precheck_timeout = 0.85
                 self.log(
                     f'Large input: scanning in {num_chunks} sequential batches '
-                    f'(≈{batch_sizes[0]} each); gentler precheck '
-                    f'(workers={precheck_workers}, timeout=1.2s).'
+                    f'(≈{batch_sizes[0]} each); precheck '
+                    f'(workers={precheck_workers}, timeout=0.85s).'
                 )
             else:
                 self.scanner.precheck_timeout = 0.7
