@@ -28,6 +28,7 @@ from PySide6.QtWidgets import (
     QFrame, QLabel, QPushButton, QLineEdit, QPlainTextEdit, QListWidget,
     QCheckBox, QScrollArea, QButtonGroup, QFileDialog, QDialog,
     QSizePolicy, QGraphicsDropShadowEffect, QAbstractItemView,
+    QTableWidget, QTableWidgetItem, QHeaderView,
 )
 
 from .parser import extract_links, resolve_source, parse_link
@@ -184,6 +185,12 @@ QLabel#tileCap   { font-size: 12px; color: $muted; }
 QListWidget#sources { background: $surface2; border: 1px solid $line; border-radius: 10px; }
 QListWidget#sources::item:selected { background: $accent; color: $white; }
 QPlainTextEdit#log { background: rgba(15,18,22,0.98); border: 1px solid $line; border-radius: 10px; }
+QTableWidget#results { background: $surface2; border: 1px solid $line; border-radius: 10px;
+    gridline-color: $line; alternate-background-color: rgba(30,35,44,0.55); }
+QTableWidget#results::item { padding: 5px 8px; }
+QTableWidget#results::item:selected { background: $accent; color: $white; }
+QHeaderView::section { background: $elev; color: $muted; border: 0; border-bottom: 1px solid $line;
+    padding: 7px 8px; font-size: 11px; font-weight: 800; }
 QPlainTextEdit#sourceInput { background: $surface2; }
 
 /* ---- Toast ---- */
@@ -544,6 +551,19 @@ class DonutWidget(QWidget):
             p.setFont(QFont('Courier New', 12, QFont.Bold))
             p.drawText(QRectF(w - 120, y - 10, 100, 20), Qt.AlignVCenter | Qt.AlignRight, str(val))
         p.end()
+
+
+class NumericItem(QTableWidgetItem):
+    """Table cell that sorts by a stored numeric key rather than its text."""
+
+    def __init__(self, text, value):
+        super().__init__(text)
+        self._value = value
+
+    def __lt__(self, other):
+        if isinstance(other, NumericItem):
+            return self._value < other._value
+        return super().__lt__(other)
 
 
 # ---------------------------------------------------------------------------
@@ -926,6 +946,35 @@ class MainWindow(QMainWindow):
             b.setEnabled(False)
             copyrow.addWidget(b)
         lay.addLayout(copyrow)
+
+        # Live results table — one row per working config, sortable by any column.
+        self.results_table = QTableWidget(0, 7)
+        self.results_table.setObjectName('results')
+        self.results_table.setHorizontalHeaderLabels(
+            ['Name', 'Proto', 'Country', 'Latency', 'Speed', 'Score', 'Class'])
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.results_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.results_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.results_table.setAlternatingRowColors(True)
+        self.results_table.setMinimumHeight(240)
+        self.results_table.setSortingEnabled(False)  # enabled after a scan finishes
+        hdr = self.results_table.horizontalHeader()
+        hdr.setSectionResizeMode(0, QHeaderView.Stretch)
+        for i in range(1, 7):
+            hdr.setSectionResizeMode(i, QHeaderView.ResizeToContents)
+        self.results_table.itemDoubleClicked.connect(self._copy_row_link)
+        lay.addWidget(self.results_table)
+
+        selrow = QHBoxLayout()
+        self.results_hint = QLabel('Tested configs appear here live. Double-click a row to copy it.')
+        self.results_hint.setObjectName('cardSub')
+        selrow.addWidget(self.results_hint)
+        selrow.addStretch(1)
+        self.copy_selected_btn = QPushButton('Copy selected')
+        self.copy_selected_btn.clicked.connect(self._copy_selected_rows)
+        selrow.addWidget(self.copy_selected_btn)
+        lay.addLayout(selrow)
         return card
 
     def _build_log_card(self):
@@ -1079,8 +1128,61 @@ class MainWindow(QMainWindow):
     def _on_dead(self, _payload):
         pass
 
-    def _on_result(self, _payload):
-        pass
+    _MAX_TABLE_ROWS = 20000
+
+    def _on_result(self, payload):
+        """Append one working config to the live results table (dead skipped)."""
+        if not isinstance(payload, dict):
+            return
+        cls = payload.get('classification', 'dead')
+        if cls == 'dead':
+            return  # dead configs live in the donut + dead.txt, not the table
+        t = self.results_table
+        if t.rowCount() >= self._MAX_TABLE_ROWS:
+            return
+        row = t.rowCount()
+        t.insertRow(row)
+        latency = float(payload.get('latency') or 0)
+        speed = float(payload.get('speed') or 0.0)
+        score = float(payload.get('score') or 0.0)
+        cc = str(payload.get('exit_country') or '').strip()
+        flag = naming.country_flag(cc)
+        country = (flag + ' ' + cc).strip() if cc else ''
+        color = {'fast': FAST, 'medium': MEDIUM, 'slow': SLOW}.get(cls, MUTED)
+
+        name_item = QTableWidgetItem(str(payload.get('remark') or 'NoRemark'))
+        name_item.setData(Qt.UserRole, payload.get('link', ''))
+        t.setItem(row, 0, name_item)
+        t.setItem(row, 1, QTableWidgetItem(str(payload.get('proto') or '')))
+        t.setItem(row, 2, QTableWidgetItem(country))
+        t.setItem(row, 3, NumericItem(str(int(latency)), latency))
+        t.setItem(row, 4, NumericItem(f'{speed:.0f}', speed))
+        t.setItem(row, 5, NumericItem(f'{score:.1f}', score))
+        cls_item = QTableWidgetItem(cls)
+        cls_item.setForeground(QColor(color))
+        t.setItem(row, 6, cls_item)
+
+    def _clear_results_table(self):
+        self.results_table.setSortingEnabled(False)
+        self.results_table.setRowCount(0)
+
+    def _row_link(self, row):
+        item = self.results_table.item(row, 0)
+        return item.data(Qt.UserRole) if item else None
+
+    def _copy_row_link(self, item):
+        link = self._row_link(item.row())
+        if link:
+            QApplication.clipboard().setText(link)
+            self.set_status('Copied 1 config to clipboard')
+
+    def _copy_selected_rows(self):
+        rows = sorted({i.row() for i in self.results_table.selectedItems()})
+        links = [self._row_link(r) for r in rows]
+        links = [l for l in links if l]
+        if links:
+            QApplication.clipboard().setText('\n'.join(links))
+            self.set_status(f'Copied {len(links)} config(s) to clipboard')
 
     def _on_finished(self, _completed, gen=-1):
         # Drop a late finish from a scan that was stopped-then-restarted.
@@ -1090,6 +1192,8 @@ class MainWindow(QMainWindow):
         has_links = bool(self.fast_links or self.medium_links or self.slow_links)
         self._set_copy_enabled(has_links)
         self._set_control_enabled(False, False, False)
+        # Results are all in now — allow sorting by any column.
+        self.results_table.setSortingEnabled(True)
         self.scan_state = 'idle'
         self._skip_precheck = False
 
@@ -1539,6 +1643,7 @@ class MainWindow(QMainWindow):
         self.medium_links = []
         self.slow_links = []
         self.active = []
+        self._clear_results_table()
         self.update_live_stats(0, 0, 0, 0)
         self.scan_state = 'running'
         self.pause_button.setText('Pause')
@@ -1765,6 +1870,13 @@ class MainWindow(QMainWindow):
                         slow_count += 1
                     else:
                         dead_count += 1
+                    # Stream working configs into the live results table.
+                    if (classification in ('fast', 'medium', 'slow')
+                            and not self._closing and gen == self._scan_generation):
+                        try:
+                            self.sig.result.emit(result)
+                        except RuntimeError:
+                            pass
                 pct = 0.15 + (td / max(reach, 1)) * 0.85
                 show_progress(pct)
                 self.set_status(f'{_batch_label()}Tested {td}/{max(reach, 1)} reachable configs', gen)
