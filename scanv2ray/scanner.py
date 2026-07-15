@@ -38,6 +38,9 @@ class Scanner:
         self.site_check = False
         self.site_strict = False
         self.site_targets = []
+        # TCP precheck connect timeout (seconds). ui.run_scan raises this a bit
+        # for large batch scans so slow-connecting configs are not missed.
+        self.precheck_timeout = 0.7
 
     def request_abort(self):
         # mark aborted and kill every currently-running xray process immediately
@@ -460,7 +463,9 @@ class Scanner:
 
         return None
 
-    def precheck_link(self, link, timeout=0.7):
+    def precheck_link(self, link, timeout=None):
+        if timeout is None:
+            timeout = getattr(self, 'precheck_timeout', 0.7)
         parsed = parser.parse_link(link)
         if not parsed or not parsed.get('host') or not parsed.get('port'):
             return {'ok': False, 'link': link, 'reason': 'parse_failed'}

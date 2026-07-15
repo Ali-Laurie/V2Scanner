@@ -36,6 +36,45 @@ def dedupe_links(links, parse_link):
     return out
 
 
+def chunk_plan(n):
+    """Split ``n`` configs into sequential batches to bound peak load.
+
+    Feeding hundreds of thousands of configs into a single pipeline pass makes
+    the app submit that many futures at once and hang. Instead we scan in
+    sequential batches (each batch is fully prechecked+tested before the next
+    starts). Returns a list of batch sizes that sums to ``n``:
+
+        n <= 5000            -> 1 batch  (no split, unchanged behavior)
+        5000  < n <= 10000   -> 2 batches
+        10000 < n <= 20000   -> 3 batches
+        20000 < n <= 50000   -> 5 batches
+        50000 < n <= 100000  -> 10 batches
+        100000 < n <= 200000 -> 20 batches
+        n > 200000           -> fixed 8000-config batches
+
+    Count-based tiers split into that many roughly-equal contiguous batches.
+    """
+    if n <= 0:
+        return []
+    if n > 200000:
+        size = 8000
+        return [min(size, n - i) for i in range(0, n, size)]
+    if n <= 5000:
+        parts = 1
+    elif n <= 10000:
+        parts = 2
+    elif n <= 20000:
+        parts = 3
+    elif n <= 50000:
+        parts = 5
+    elif n <= 100000:
+        parts = 10
+    else:  # 100000 < n <= 200000
+        parts = 20
+    base, rem = divmod(n, parts)
+    return [base + (1 if i < rem else 0) for i in range(parts)]
+
+
 def run_pipeline(scanner, links, *, method, timeout, precheck_workers, test_workers,
                  should_stop, wait_if_paused,
                  report_precheck, report_dead, report_test,

@@ -1335,6 +1335,31 @@ class ConfigScannerApp(ctk.CTk):
                 f'ultra={"on" if ultra else "off"}.'
             )
 
+            # Split very large inputs into sequential batches so the pipeline
+            # never holds hundreds of thousands of futures at once (which hangs
+            # the app). Each batch is fully prechecked+tested before the next
+            # starts; results/counters accumulate across batches. Small inputs
+            # (<= 5000) stay a single batch = original behavior.
+            batch_sizes = engine.chunk_plan(total_links)
+            num_chunks = max(1, len(batch_sizes))
+            batches = []
+            _off = 0
+            for _sz in batch_sizes:
+                batches.append(unique_links[_off:_off + _sz])
+                _off += _sz
+            if num_chunks > 1:
+                # Gentler phase 1 on huge inputs: fewer concurrent TCP probes and
+                # a more patient timeout so slow-connecting configs are not missed.
+                precheck_workers = min(precheck_workers, 100)
+                self.scanner.precheck_timeout = 1.2
+                self.log(
+                    f'Large input: scanning in {num_chunks} sequential batches '
+                    f'(≈{batch_sizes[0]} each); gentler precheck '
+                    f'(workers={precheck_workers}, timeout=1.2s).'
+                )
+            else:
+                self.scanner.precheck_timeout = 0.7
+
             results = []
             reachable = 0
             test_done = 0
@@ -1343,14 +1368,20 @@ class ConfigScannerApp(ctk.CTk):
             slow_count = 0
             dead_count = 0
             last_pct = 0.0
+            chunk_index = 0
 
             def show_progress(pct):
-                # Precheck and test phases overlap while streaming, so keep the
-                # bar monotonic to avoid it bouncing backwards.
+                # `pct` is progress WITHIN the current batch (0..1). Map it onto
+                # the overall bar across all batches, and keep it monotonic so it
+                # never bounces backwards while precheck/test streams overlap.
                 nonlocal last_pct
-                if pct > last_pct:
-                    last_pct = pct
+                overall = (chunk_index + min(pct, 1.0)) / num_chunks
+                if overall > last_pct:
+                    last_pct = overall
                 self.set_progress(min(last_pct, 1.0))
+
+            def _batch_label():
+                return f'Batch {chunk_index + 1}/{num_chunks} · ' if num_chunks > 1 else ''
 
             def report_dead(link, parsed, reason, stage):
                 nonlocal dead_count
@@ -1365,7 +1396,7 @@ class ConfigScannerApp(ctk.CTk):
                 reachable = reach
                 pct = (pd / total) * 0.15 if total else 0
                 show_progress(pct)
-                self.set_status(f'Prechecked {pd}/{total} ({reach} reachable)')
+                self.set_status(f'{_batch_label()}Prechecked {pd}/{total} ({reach} reachable)')
 
             def report_test(item, result, td, reach):
                 nonlocal test_done, reachable, fast_count, medium_count, slow_count, dead_count
@@ -1384,7 +1415,7 @@ class ConfigScannerApp(ctk.CTk):
                         dead_count += 1
                 pct = 0.15 + (td / max(reach, 1)) * 0.85
                 show_progress(pct)
-                self.set_status(f'Tested {td}/{max(reach, 1)} reachable configs')
+                self.set_status(f'{_batch_label()}Tested {td}/{max(reach, 1)} reachable configs')
                 self.update_live_stats(fast_count, medium_count, slow_count, dead_count)
 
             def should_stop():
@@ -1403,20 +1434,39 @@ class ConfigScannerApp(ctk.CTk):
                 # Phase 1 finished (or was skipped) -> phase 2 begins.
                 self.set_phase('test')
 
-            engine.run_pipeline(
-                self.scanner, unique_links,
-                method=selected_method, timeout=timeout,
-                precheck_workers=precheck_workers, test_workers=test_workers,
-                should_stop=should_stop, wait_if_paused=wait_if_paused,
-                report_precheck=report_precheck, report_dead=report_dead,
-                report_test=report_test, retry_failed=retry_failed,
-                should_stop_precheck=should_stop_precheck,
-                on_prechecks_done=on_prechecks_done,
-            )
+            cumulative_reachable = 0
+            cumulative_test_done = 0
+            for chunk_index in range(num_chunks):
+                if self.scan_state in ('stopping', 'stopping_save'):
+                    break
+                batch = batches[chunk_index]
+                if not batch:
+                    continue
+                # Each batch is its own precheck -> test pass.
+                self._skip_precheck = False
+                self.set_phase('precheck')
+                if num_chunks > 1:
+                    self.log(f'--- Batch {chunk_index + 1}/{num_chunks}: {len(batch)} configs ---')
+                stats = engine.run_pipeline(
+                    self.scanner, batch,
+                    method=selected_method, timeout=timeout,
+                    precheck_workers=precheck_workers, test_workers=test_workers,
+                    should_stop=should_stop, wait_if_paused=wait_if_paused,
+                    report_precheck=report_precheck, report_dead=report_dead,
+                    report_test=report_test, retry_failed=retry_failed,
+                    should_stop_precheck=should_stop_precheck,
+                    on_prechecks_done=on_prechecks_done,
+                )
+                cumulative_reachable += stats.get('reachable', 0)
+                cumulative_test_done += stats.get('test_done', 0)
 
             if self.scan_state not in ('stopping', 'stopping_save'):
-                self.log(f'Precheck complete: {reachable}/{total_links} reachable endpoints.')
-                self.log(f'Testing complete: {test_done}/{max(reachable, 1)} reachable configs tested.')
+                # A fully completed scan is 100% even if the final batch had zero
+                # reachable configs (report_test never fires for an all-dead batch,
+                # which would otherwise leave the overall bar short of full).
+                self.set_progress(1.0)
+                self.log(f'Precheck complete: {cumulative_reachable}/{total_links} reachable endpoints.')
+                self.log(f'Testing complete: {cumulative_test_done}/{max(cumulative_reachable, 1)} reachable configs tested.')
 
             if self.scan_state != 'stopping':
                 # Rename each result's remark + link fragment, then derive the copy
