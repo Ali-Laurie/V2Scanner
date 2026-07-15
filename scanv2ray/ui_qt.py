@@ -86,9 +86,9 @@ PROTOCOLS = ['vmess', 'vless', 'ss', 'trojan', 'socks', 'http',
              'hysteria2', 'tuic', 'anytls']
 
 PRESETS = {
-    'Slow':   {'precheck': '80',  'test': '12', 'speed': '6',  'timeout': '5000'},
-    'Medium': {'precheck': '200', 'test': '32', 'speed': '24', 'timeout': '3500'},
-    'Fast':   {'precheck': '400', 'test': '64', 'speed': '40', 'timeout': '2500'},
+    'Slow':   {'precheck': '80',  'test': '24', 'speed': '6',  'timeout': '5000'},
+    'Medium': {'precheck': '200', 'test': '48', 'speed': '24', 'timeout': '3500'},
+    'Fast':   {'precheck': '400', 'test': '96', 'speed': '40', 'timeout': '2500'},
 }
 
 SITE_TARGETS_DEFAULT = [
@@ -771,11 +771,8 @@ class MainWindow(QMainWindow):
     def _build_setup_card(self):
         card, lay = self._card('Scan setup')
 
-        lay.addWidget(self._muted_label('Scan mode'))
-        self.mode_frame, self.mode_group = self._segmented(['Quick', 'Full'], 'Quick')
-        lay.addWidget(self.mode_frame)
-
         self.ultra_switch = ToggleSwitch('Ultra scan')
+        self.ultra_switch.setChecked(True)   # on by default; user can turn it off
         lay.addWidget(self.ultra_switch)
 
         self.select_button = QPushButton('Choose folder')
@@ -811,7 +808,7 @@ class MainWindow(QMainWindow):
         agrid.addWidget(self._muted_label('Precheck workers'), 0, 0)
         agrid.addWidget(self._muted_label('Test workers'), 0, 1)
         self.precheck_entry = num_field('200')
-        self.test_entry = num_field('32')
+        self.test_entry = num_field('48')
         agrid.addWidget(self.precheck_entry, 1, 0)
         agrid.addWidget(self.test_entry, 1, 1)
 
@@ -961,7 +958,6 @@ class MainWindow(QMainWindow):
         self.clear_sources_btn.clicked.connect(self.clear_sources)
         for chk in self.protocol_checks.values():
             chk.stateChanged.connect(lambda *_: self.update_link_count())
-        self.mode_group.buttonClicked.connect(lambda *_: self.update_link_count())
         self.preset_group.buttonClicked.connect(
             lambda btn: self._apply_preset(btn.text()))
         self.select_button.clicked.connect(self.select_folder)
@@ -1177,11 +1173,8 @@ class MainWindow(QMainWindow):
     # Sources management (ported verbatim from ui.py)
     # ------------------------------------------------------------------
     def _selected_methods(self):
-        return ['xray'] if self._scan_mode() == 'Full' else ['fast']
-
-    def _scan_mode(self):
-        btn = self.mode_group.checkedButton()
-        return btn.text() if btn else 'Quick'
+        # Quick mode was removed — always run the full (xray) test.
+        return ['xray']
 
     def _add_links(self, links):
         added_links = 0
@@ -1569,8 +1562,8 @@ class MainWindow(QMainWindow):
             if test_workers <= 0:
                 raise ValueError
         except Exception:
-            test_workers = 32
-            self.log('Invalid test workers. Using 32.')
+            test_workers = 48
+            self.log('Invalid test workers. Using 48.')
 
         try:
             speed_limit = int(self.speed_entry.text().strip())
